@@ -1,0 +1,3 @@
+[submodule "mc1322x-sys/libmc1322x"]
+	path = mc1322x-sys/libmc1322x
+	url = https://github.com/SimonIT/libmc1322x.git

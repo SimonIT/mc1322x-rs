@@ -1,0 +1,5 @@
+[workspace]
+members = [
+    "mc1322x-sys"
+]
+resolver = "2"
