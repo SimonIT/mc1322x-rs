@@ -1,5 +1,6 @@
 [workspace]
 members = [
-    "mc1322x-sys"
+    "mc1322x-sys",
+    "mc1322x-hal"
 ]
 resolver = "2"
