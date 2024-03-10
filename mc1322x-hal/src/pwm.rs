@@ -31,18 +31,18 @@ impl ErrorType for Pwm { type Error = Error; }
 
 impl SetDutyCycle for Pwm {
     fn max_duty_cycle(&self) -> u16 {
-        (65536 / 2) as u16
+        u16::MAX
     }
 
     fn set_duty_cycle(&mut self, duty: u16) -> Result<(), Self::Error> {
         if !self.initialized {
             unsafe {
-                pwm_init_ex(self.timer_num as c_int, self.rate, duty as u32 * 2, 1);
+                pwm_init_ex(self.timer_num as c_int, self.rate, duty as u32, 1);
             }
             self.initialized = true;
         } else {
             unsafe {
-                pwm_duty_ex(self.timer_num as c_int, duty as u32 * 2);
+                pwm_duty_ex(self.timer_num as c_int, duty as u32);
             }
         }
         Ok(())
