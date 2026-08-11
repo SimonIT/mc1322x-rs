@@ -3,5 +3,10 @@
 extern crate mc1322x_sys;
 extern crate embedded_hal;
 
-mod i2c;
-mod pwm;
+pub mod adc;
+pub mod delay;
+pub mod gpio;
+pub mod i2c;
+pub mod pwm;
+pub mod spi;
+pub mod uart;

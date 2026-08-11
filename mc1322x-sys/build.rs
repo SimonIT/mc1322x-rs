@@ -11,10 +11,11 @@ fn main() {
         .expect("cannot canonicalize path");
     let lib = root.join("lib");
     let include = lib.join("include");
-    let src = root.join("src");
     let tests = root.join("tests");
     let header = include.join("mc1322x.h");
     let header_str = header.to_str().unwrap();
+    let gpio_util = include.join("gpio-util.h");
+    let gpio_util_str = gpio_util.to_str().unwrap();
 
     println!(
         "cargo:include={}",
@@ -50,7 +51,8 @@ fn main() {
 
     let bindings = bindgen::Builder::default()
         .header(header_str)
-        .clang_arg(format!("-I{}", &include.display()))
+        .header(gpio_util_str)
+        .clang_arg(format!("-I{}", include.display()))
         .use_core()
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .generate()

@@ -1,8 +1,9 @@
 [package]
 name = "mc1322x-hal"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 mc1322x-sys = { path = "../mc1322x-sys" }
 embedded-hal = "1.0.0"
+embedded-io = "0.7.0"
