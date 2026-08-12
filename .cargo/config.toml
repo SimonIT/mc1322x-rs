@@ -1,0 +1,11 @@
+[build]
+target = "thumbv4t-none-eabi"
+
+[unstable]
+build-std = ["core"]
+
+[target.thumbv4t-none-eabi]
+rustflags = [
+  "-Clinker=arm-none-eabi-ld",                       # uses the ARM linker
+  "-Clink-arg=-Tmc1322x-sys/libmc1322x/mc1322x.lds", # sets the link script
+]

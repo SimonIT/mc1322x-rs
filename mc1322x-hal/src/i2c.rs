@@ -1,7 +1,7 @@
 use embedded_hal::i2c::{self, ErrorType, I2c, NoAcknowledgeSource, Operation, SevenBitAddress};
 use mc1322x_sys::{
-    gpio_reg_set, gpio_select_function, I2C_BASE, I2C_CKEN, I2C_MAL, I2C_MBB, I2C_MCF, I2C_MEN,
-    I2C_MIF, I2C_MSTA, I2C_MTX, I2C_RSTA, I2C_RXAK, I2C_SCL, I2C_SDA, I2C_TXAK,
+    I2C_BASE, I2C_CKEN, I2C_MAL, I2C_MBB, I2C_MCF, I2C_MEN, I2C_MIF, I2C_MSTA, I2C_MTX, I2C_RSTA,
+    I2C_RXAK, I2C_SCL, I2C_SDA, I2C_TXAK, gpio_reg_set, gpio_select_function,
 };
 
 // I2C register map (byte-wide MMIO, see libmc1322x/lib/include/i2c.h)

@@ -7,3 +7,5 @@ edition = "2024"
 mc1322x-sys = { path = "../mc1322x-sys" }
 embedded-hal = "1.0.0"
 embedded-io = "0.7.0"
+rand_core = { version = "0.10.1", default-features = false }
+critical-section = { version = "1.2", features = ["restore-state-u32"] }

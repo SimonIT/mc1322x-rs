@@ -27,7 +27,9 @@ impl embedded_hal::pwm::Error for Error {
     }
 }
 
-impl ErrorType for Pwm { type Error = Error; }
+impl ErrorType for Pwm {
+    type Error = Error;
+}
 
 impl SetDutyCycle for Pwm {
     fn max_duty_cycle(&self) -> u16 {

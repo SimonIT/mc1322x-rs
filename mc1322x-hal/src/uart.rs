@@ -1,9 +1,12 @@
 use core::convert::Infallible;
 use embedded_io::{ErrorType, Read, Write};
 use mc1322x_sys::{
-    gpio_select_function, gpio_set_pad_dir, uart_flowctl, uart_setbaud, UART_struct, UART1, UART2,
-    UCON, UDATA, URXCON, UTXCON,
+    UART_struct, UCON, UDATA, URXCON, UTXCON, gpio_select_function, gpio_set_pad_dir, uart_flowctl,
+    uart_setbaud,
 };
+
+const UART1_BASE: usize = 0x8000_5000;
+const UART2_BASE: usize = 0x8000_B000;
 
 const UCON_TXE: u32 = 1 << 0;
 const UCON_RXE: u32 = 1 << 1;
@@ -40,11 +43,9 @@ pub struct Uart {
 impl Uart {
     /// Configure and enable a UART at the requested baud rate.
     pub fn new(id: UartId, baud: u32) -> Self {
-        let (uart, tx_pin, rx_pin) = unsafe {
-            match id {
-                UartId::Uart1 => (UART1, U1TX_PIN, U1RX_PIN),
-                UartId::Uart2 => (UART2, U2TX_PIN, U2RX_PIN),
-            }
+        let (uart, tx_pin, rx_pin) = match id {
+            UartId::Uart1 => (UART1_BASE as *mut UART_struct, U1TX_PIN, U1RX_PIN),
+            UartId::Uart2 => (UART2_BASE as *mut UART_struct, U2TX_PIN, U2RX_PIN),
         };
 
         let uart = Self { uart };

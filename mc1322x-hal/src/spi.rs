@@ -1,6 +1,6 @@
 use core::convert::Infallible;
 use embedded_hal::spi::{self, SpiBus};
-use mc1322x_sys::{gpio_select_function, gpio_set_pad_dir, REF_OSC};
+use mc1322x_sys::{REF_OSC, gpio_select_function, gpio_set_pad_dir};
 
 const SPI_BASE: usize = 0x8000_2000;
 
@@ -95,7 +95,8 @@ impl Spi {
     fn transfer_word(&mut self, tx: u8) -> u8 {
         unsafe {
             (SPI_TX_DATA as *mut u32).write_volatile((tx as u32) << 24);
-            (SPI_CLK_CTRL as *mut u32).write_volatile((SCK_COUNT << SPI_SCK_COUNT_SHIFT) | SPI_START | DATA_LENGTH);
+            (SPI_CLK_CTRL as *mut u32)
+                .write_volatile((SCK_COUNT << SPI_SCK_COUNT_SHIFT) | SPI_START | DATA_LENGTH);
             while (SPI_STATUS as *const u32).read_volatile() & SPI_INT == 0 {}
             let rx = (SPI_RX_DATA as *const u32).read_volatile() & 0xFF;
             (SPI_STATUS as *mut u32).write_volatile(SPI_INT);

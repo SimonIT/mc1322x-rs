@@ -1,8 +1,6 @@
 use core::convert::Infallible;
 use embedded_hal::digital::{ErrorType, InputPin, OutputPin, StatefulOutputPin};
-use mc1322x_sys::{
-    gpio_read, gpio_reset, gpio_select_function, gpio_set, gpio_set_pad_dir,
-};
+use mc1322x_sys::{gpio_read, gpio_reset, gpio_select_function, gpio_set, gpio_set_pad_dir};
 
 const PAD_DIR_INPUT: u8 = 0;
 const PAD_DIR_OUTPUT: u8 = 1;
