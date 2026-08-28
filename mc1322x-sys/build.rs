@@ -17,7 +17,14 @@ fn main() {
     let gpio_util = include.join("gpio-util.h");
     let gpio_util_str = gpio_util.to_str().unwrap();
     let src = root.join("src");
-    let srclib = src.join("src.a");
+    // Linked against instead of the plain `src.a`: any program calling a ROM routine that
+    // itself calls through the boot ROM's "ROM Patch Table Vector" mechanism (fixed RAM
+    // offsets 0x20/0x60/0xa0/0xe0 from the load address - see `start.S`'s `USE_ROM_VARS`
+    // block) needs those slots reserved and populated with `bx lr` stubs, or the ROM call
+    // jumps into whatever unrelated code happens to occupy that RAM instead. `libmc1322x`'s
+    // own tests/Makefile builds every target touching `nvm_*`/radio ROM calls against this
+    // variant (`TARGETS_WITH_ROM_VARS`) for exactly this reason.
+    let srclib = src.join("src-romvars.a");
 
     println!("cargo:include={}", include.display());
 
@@ -39,6 +46,22 @@ fn main() {
         std::str::from_utf8(&output.stderr).unwrap()
     );
 
+    // The plain `make` above builds `src.a` as a side effect of the default (non-ROM-vars)
+    // TARGETS, but doesn't reliably reach `src-romvars.a` (a dependency of the
+    // TARGETS_WITH_ROM_VARS .bin files, several boards deep in `Makefile.include`'s
+    // per-board recursion) - ask for it directly so it exists regardless.
+    let romvars_output = Command::new("make")
+        .current_dir(&src)
+        .arg("src-romvars.a")
+        .output()
+        .expect("failed to execute make for src-romvars.a");
+    assert!(
+        romvars_output.status.success(),
+        "make src-romvars.a failed:\nstdout: {}\nstderr: {}",
+        std::str::from_utf8(&romvars_output.stdout).unwrap(),
+        std::str::from_utf8(&romvars_output.stderr).unwrap()
+    );
+
     println!("cargo:rerun-if-changed={}", lib.display());
     println!("cargo:rustc-link-search=native={}", lib.display());
 
@@ -46,7 +69,7 @@ fn main() {
 
     println!("cargo:rerun-if-changed={}", srclib.display());
     println!("cargo:rustc-link-search=native={}", src.display());
-    println!("cargo:rustc-link-lib=static:+verbatim=src.a");
+    println!("cargo:rustc-link-lib=static:+verbatim=src-romvars.a");
 
     let multilib_flags = [
         "-march=armv4t",
@@ -61,6 +84,17 @@ fn main() {
         libc_path.parent().unwrap().display()
     );
     println!("cargo:rustc-link-lib=c");
+
+    // `libmc1322x/lib/pwm.c`'s `switch` statements on `int timer_num` compile to Thumb-1
+    // jump-table lookups needing `__gnu_thumb1_case_uqi`, a libgcc helper - nothing else in
+    // this workspace pulls pwm.c's object into the link, so this only surfaced once
+    // `mc1322x-hal::pwm` was first actually exercised (`examples/pwm-selftest`).
+    let libgcc_path = arm_none_eabi_gcc_file(&multilib_flags, "libgcc.a");
+    println!(
+        "cargo:rustc-link-search=native={}",
+        libgcc_path.parent().unwrap().display()
+    );
+    println!("cargo:rustc-link-lib=gcc");
 
     let bindings = bindgen::Builder::default()
         .header(header_str)

@@ -4,8 +4,18 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-mc1322x-sys = { path = "../mc1322x-sys" }
-embedded-hal = "1.0.0"
-embedded-io = "0.7.0"
-rand_core = { version = "0.10.1", default-features = false }
 critical-section = { version = "1.2", features = ["restore-state-u32"] }
+embedded-cal = { git = "https://github.com/lake-rs/embedded-cal" }
+embedded-hal = "1.0.0"
+embedded-hal-async = "1.0.0"
+embedded-io = "0.7.0"
+embedded-io-async = "0.7.0"
+embedded-storage = "0.3.1"
+embedded-time = { version = "0.12.1", optional = true }
+fugit = { version = "0.5.0", optional = true }
+mc1322x-sys = { path = "../mc1322x-sys" }
+rand_core = { version = "0.10.1", default-features = false }
+
+[features]
+fugit = ["dep:fugit"]
+embedded-time = ["dep:embedded-time"]

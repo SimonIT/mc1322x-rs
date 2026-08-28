@@ -58,9 +58,18 @@ impl Rng {
 
     /// Reseed the LFSR.
     ///
-    /// Two `Rng`s seeded with the same value produce the same stream: seed
-    /// from a value that actually varies (e.g. a factory-programmed ID or a
-    /// timer) if you need runs to differ across resets.
+    /// Seeding once (right after MACA comes up) and reading is deterministic: the same seed
+    /// always produces the same first read, and reads afterward form the same deterministic
+    /// chain. Reseeding *again* later, after other reads have already happened, is not
+    /// reliably deterministic - the result depends on how many prior reads/writes have
+    /// happened, not just the seed value, suggesting the write interacts with some
+    /// pipelined/staged internal state rather than atomically resetting a single register.
+    /// Not root-caused: there's no reference use of `MACA_RANDOM` as a write anywhere in
+    /// `libmc1322x` (only reads, e.g. `per.c`'s `random_short_addr()`) to check against, and
+    /// the RM (§9.7.2) says only "writing to this register initializes the engine with a
+    /// seed" - no detail on timing or on what a second seed call does relative to whatever
+    /// the engine already holds. If you need a reproducible sequence, seed once right after
+    /// [`ensure_maca_ready`] brings MACA up and don't reseed later expecting the same result.
     pub fn seed(&mut self, seed: u32) {
         unsafe { MACA_RANDOM.write_volatile(seed) }
     }
