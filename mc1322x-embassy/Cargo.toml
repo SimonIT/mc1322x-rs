@@ -1,0 +1,17 @@
+[package]
+name = "mc1322x-embassy"
+version = "0.1.0"
+edition = "2024"
+description = "Embassy platform support for the NXP MC1322x"
+
+[dependencies]
+critical-section = { version = "1.2", features = ["restore-state-u32"] }
+embassy-time = { version = "0.5", features = [
+  "generic-queue-16",
+  "tick-hz-1_000",
+] }
+embassy-time-driver = { version = "0.2", features = ["tick-hz-1_000"] }
+embassy-time-queue-utils = { version = "0.3", features = ["generic-queue-16"] }
+heapless = { version = "0.9", features = ["portable-atomic-critical-section"] }
+mc1322x-hal = { path = "../mc1322x-hal" }
+mc1322x-sys = { path = "../mc1322x-sys" }
