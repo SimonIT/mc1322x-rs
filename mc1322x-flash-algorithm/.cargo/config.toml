@@ -1,0 +1,21 @@
+[target.armv4t-none-eabi]
+rustflags = [
+  "-C",
+  "link-arg=--nmagic",
+  "-C",
+  "link-arg=-Tlink.x",
+  # Code-size optimizations
+  "-C",
+  "llvm-args=--inline-threshold=5",
+  "-C",
+  "no-vectorize-loops",
+  "-C",
+  "force-frame-pointers=no",
+]
+runner = "target-gen test template.yaml target/definition.yaml"
+
+[build]
+target = "armv4t-none-eabi"
+
+[unstable]
+build-std = ["core"]
