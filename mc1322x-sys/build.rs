@@ -50,9 +50,17 @@ fn main() {
     // TARGETS, but doesn't reliably reach `src-romvars.a` (a dependency of the
     // TARGETS_WITH_ROM_VARS .bin files, several boards deep in `Makefile.include`'s
     // per-board recursion) - ask for it directly so it exists regardless.
+    //
+    // This must run from `tests/` (not `src/`, which has no `Makefile` - only the
+    // variable-less `Makefile.src` fragment it `-include`s): `tests/Makefile` sets `MC1322X :=
+    // ..` and defines the real `$(MC1322X)/src/src-romvars.a` rule, so the target is requested
+    // by that same relative path. A stale `src/src-romvars.a` normally masked this working by
+    // accident (cargo's build-script caching meant this command wasn't actually re-run for a
+    // long time) - if this ever regresses, deleting `src/{start,start-romvars}.o` and
+    // `src/src{,-romvars}.a` forces a clean rebuild that exercises this path for real.
     let romvars_output = Command::new("make")
-        .current_dir(&src)
-        .arg("src-romvars.a")
+        .current_dir(&tests)
+        .arg("../src/src-romvars.a")
         .output()
         .expect("failed to execute make for src-romvars.a");
     assert!(
