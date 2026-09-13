@@ -62,16 +62,27 @@ pub struct Delay;
 
 impl Delay {
     /// Start and calibrate the RTC on the ring oscillator.
+    ///
+    /// This only sets up the RTC itself; it deliberately does *not* enable the CRM interrupt
+    /// in the ITC. The blocking [`DelayNs::delay_ms`] impl below (`rtc_delay_ms`, a ROM
+    /// busy-wait) never uses interrupts at all, so a caller that only ever uses the
+    /// synchronous API should never have a live CRM IRQ vector enabled on its behalf - see
+    /// [`Delay::ensure_crm_interrupt_enabled`], called lazily from the async path instead.
     pub fn new() -> Self {
         unsafe {
             rtc_init_osc(0);
-            // Route the CRM interrupt through the ITC: `NIPEND` only reports `INT_NUM_CRM` as
-            // pending, and `irq()` only enters the block that calls `rtc_isr`, if this is
-            // enabled here. Only affects the async path below - the blocking `delay_ms`
-            // (`rtc_delay_ms`, a ROM busy-wait) doesn't use interrupts.
-            core::ptr::write_volatile((INTBASE + INTENNUM_OFF) as *mut u32, INT_NUM_CRM);
         }
         Delay
+    }
+
+    /// Route the CRM interrupt through the ITC: `NIPEND` only reports `INT_NUM_CRM` as pending,
+    /// and `irq()` only enters the block that calls `rtc_isr`, if this is enabled. Only the
+    /// async [`Delay::wait_rtc_ticks`] path needs this, so it's called from there instead of
+    /// unconditionally in [`Delay::new`].
+    fn ensure_crm_interrupt_enabled() {
+        unsafe {
+            core::ptr::write_volatile((INTBASE + INTENNUM_OFF) as *mut u32, INT_NUM_CRM);
+        }
     }
 }
 
@@ -108,6 +119,7 @@ impl Delay {
     /// margin rather than never progressing, this converges in a handful of iterations at
     /// most.
     async fn wait_rtc_ticks(&mut self, ticks: u32) {
+        Self::ensure_crm_interrupt_enabled();
         let anchor = unsafe { RTC_COUNT.read_volatile() };
         let mut remaining = ticks.max(1);
         loop {
