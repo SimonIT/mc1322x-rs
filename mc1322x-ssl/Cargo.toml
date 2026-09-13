@@ -1,0 +1,12 @@
+[package]
+name = "mc1322x-ssl"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Minimal Second Stage Loader: writes a firmware image to internal flash over UART1, per NXP AN3860's documented protocol"
+
+[dependencies]
+mc1322x-hal = { path = "../mc1322x-hal" }
+mc1322x-sys = { path = "../mc1322x-sys" }
+embedded-io = "0.7.0"
+embedded-storage = "0.3.1"
