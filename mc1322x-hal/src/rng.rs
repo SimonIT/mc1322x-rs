@@ -4,6 +4,8 @@ use critical_section::Mutex;
 use mc1322x_sys::{MACA_BASE, maca_init};
 use rand_core::TryRng;
 
+use crate::power::{power_up_regulators, trim_xtal};
+
 const MACA_RANDOM: *mut u32 = (MACA_BASE as usize + 0x08) as *mut u32;
 
 // The ARM7TDMI core in the MC1322x has no atomic instructions, so the
@@ -14,14 +16,16 @@ static MACA_READY: Mutex<Cell<bool>> = Mutex::new(Cell::new(false));
 /// Bring up the MACA block for [`Rng`] use, if this function hasn't already
 /// done so.
 ///
-/// Calls `mc1322x_sys::maca_init()` (a full MACA reset and PHY bring-up) on
-/// the first call and is a no-op afterwards. `mc1322x-radio`'s
-/// `Mc1322xRadio::init` calls through this same function, so it is safe to
-/// call this whether or not the radio is also in use: whichever of the two
-/// runs first performs the real init, and the other just confirms MACA is
-/// already up. This only covers coordination through this function, though —
-/// code that calls `maca_init` / `reset_maca` directly, bypassing this guard,
-/// can still race with it.
+/// Calls [`trim_xtal`], [`power_up_regulators`] and `mc1322x_sys::maca_init()`
+/// (a full MACA reset and PHY bring-up) on the first call, in that order —
+/// the same order every radio-using program in `libmc1322x`'s own `tests/`
+/// and Contiki's `redbee-econotag` platform init use, and is a no-op
+/// afterwards. `mc1322x-radio`'s `Mc1322xRadio::init` calls through this same
+/// function, so it is safe to call this whether or not the radio is also in
+/// use: whichever of the two runs first performs the real init, and the
+/// other just confirms MACA is already up. This only covers coordination
+/// through this function, though — code that calls `maca_init` /
+/// `reset_maca` directly, bypassing this guard, can still race with it.
 pub fn ensure_maca_ready() {
     let already_ready = critical_section::with(|cs| {
         let ready = MACA_READY.borrow(cs);
@@ -30,6 +34,8 @@ pub fn ensure_maca_ready() {
         was_ready
     });
     if !already_ready {
+        trim_xtal();
+        power_up_regulators();
         unsafe { maca_init() };
     }
 }

@@ -1,6 +1,32 @@
-//! Voltage regulator power-up, shared by peripherals whose bring-up needs it.
+//! Voltage regulator power-up and crystal trim, shared by peripherals whose bring-up needs them.
 
 use mc1322x_sys::CRM_BASE;
+
+/// Trim the 24 MHz reference crystal oscillator to the board's calibrated frequency.
+///
+/// Replicates `trim_xtal()` (`mc1322x-sys/libmc1322x/src/default_lowlevel.h`'s
+/// `pack_XTAL_CNTL(CTUNE_4PF, CTUNE, FTUNE, IBIAS)` macro) for the Redbee Econotag board (the
+/// only board this workspace targets - see `board/redbee-econotag.h`'s `CTUNE_4PF`/`CTUNE`/
+/// `FTUNE`, and `board/std_conf.h`'s `IBIAS` default, which Econotag doesn't override).
+///
+/// Every radio-using program in `libmc1322x`'s own `tests/` (`rftest-tx`, `rftest-rx`,
+/// `autoack-tx`, `autoack-rx`, ...) and Contiki's own `redbee-econotag` platform
+/// (`init_lowlevel()` in `contiki-mc1322x-main.c`) calls this unconditionally as one of the very
+/// first steps of `main`, before `maca_init()` - this workspace's own boot path never did. An
+/// untrimmed crystal is an out-of-spec reference clock for the MACA's PLL frequency synthesizer;
+/// this is the prime suspect for a MACA status 12 (`PLL_UNLOCK`) reliably seen on the very first
+/// real transmit (see the `maca_tx_pll_unlock_runaway` project memory).
+pub(crate) fn trim_xtal() {
+    const CTUNE_4PF: u32 = 1;
+    const CTUNE: u32 = 11;
+    const FTUNE: u32 = 7;
+    const IBIAS: u32 = 0x1F;
+
+    unsafe {
+        let xtal_cntl = (CRM_BASE + 0x40) as *mut u32;
+        xtal_cntl.write_volatile((CTUNE_4PF << 25) | (CTUNE << 21) | (FTUNE << 16) | (IBIAS << 8) | 0x52);
+    }
+}
 
 /// Turn on the 1.5V/1.8V regulators that several peripherals (NVM flash access, the ASM
 /// crypto block) need running before they'll work.
