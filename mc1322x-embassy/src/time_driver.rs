@@ -152,8 +152,12 @@ pub fn init() {
             DRIVER.last_boundary.borrow(cs).set(boundary);
             write16(TMR_REGOFF_COMP1, boundary.wrapping_add(PERIOD as u16));
 
-            // Enable TMR0.
-            write16(TMR_REGOFF_ENBL, 0x01);
+            // Enable TMR0. `TMR_ENBL` is a single shared register for all four TMR channels
+            // ("one enable register to rule them all", per libmc1322x's tmr.h) - the reference
+            // `tmr-ints.c` test writes 0xf (all four channels) rather than just this channel's
+            // bit; matching that here mattered on real hardware (bit 0 alone left the counter
+            // not running).
+            write16(TMR_REGOFF_ENBL, 0x0f);
         }
         false
     });
