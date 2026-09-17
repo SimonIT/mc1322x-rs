@@ -1,0 +1,23 @@
+[package]
+name = "mc1322x-radio"
+version = "0.1.0"
+edition = "2024"
+description = "IEEE 802.15.4 radio driver for the MC1322x MACA coprocessor, with optional dot15d4::phy::radio::Radio and ieee802154::mac::Frame integration"
+
+[dependencies]
+byte = { version = "0.2", optional = true }
+critical-section = { version = "1.2", features = ["restore-state-u32"] }
+dot15d4 = { version = "0.1", default-features = false, optional = true }
+heapless = { version = "0.8", features = [
+  "portable-atomic-critical-section",
+], optional = true }
+ieee802154 = { version = "0.6", default-features = false, optional = true }
+mc1322x-hal = { path = "../mc1322x-hal" }
+mc1322x-sys = { path = "../mc1322x-sys" }
+portable-atomic = { version = "1.5", features = ["critical-section"] }
+radio-hal = { package = "radio", version = "0.12", default-features = false, optional = true }
+
+[features]
+dot15d4 = ["dep:dot15d4", "dep:heapless"]
+ieee802154 = ["dep:byte", "dep:ieee802154"]
+radio-hal = ["dep:radio-hal"]
