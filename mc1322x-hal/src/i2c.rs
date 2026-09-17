@@ -1,13 +1,11 @@
-use core::cell::RefCell;
-use core::task::{Poll, Waker};
-use critical_section::Mutex;
+use core::task::Poll;
 use embedded_hal::i2c::{self, ErrorType, I2c, NoAcknowledgeSource, Operation, SevenBitAddress};
 use mc1322x_sys::{
     I2C_BASE, I2C_CKEN, I2C_MAL, I2C_MBB, I2C_MCF, I2C_MEN, I2C_MIEN, I2C_MIF, I2C_MSTA, I2C_MTX,
     I2C_RSTA, I2C_RXAK, I2C_SCL, I2C_SDA, I2C_TXAK, INTBASE, gpio_reg_set, gpio_select_function,
 };
 
-use crate::util::yield_now;
+use crate::util::{WakerCell, yield_now};
 
 // I2C register map (byte-wide MMIO, see libmc1322x/lib/include/i2c.h)
 const I2C_ADR: *mut u8 = I2C_BASE as usize as *mut u8;
@@ -22,7 +20,6 @@ const GPIO_PAD_PU_EN0: *mut u32 = 0x8000_0010 as *mut u32;
 const GPIO_PAD_PU_SEL0: *mut u32 = 0x8000_0030 as *mut u32;
 
 const I2C_ALT_FUNCTION: u8 = 1;
-const I2C_CLOCK_DIVIDER: u8 = 0x20; // ~150 kHz on the Redbee Econotag
 
 // ITC (interrupt controller) offset/number for the I2C completion interrupt (see
 // `isr.h`'s `INTENNUM_OFF` and `interrupt_nums`). `irq()` (linked from `libmc1322x`)
@@ -33,11 +30,8 @@ const INT_NUM_I2C: u32 = 4;
 /// Waker for the in-flight [`I2c0::wait_byte_async`] call, if any.
 ///
 /// Set (with `I2C_MIEN` armed) by `wait_byte_async` before it returns `Pending`, and taken
-/// and woken by [`i2c_isr`] the next time the module raises the interrupt. Guarded by
-/// `critical_section`'s `Mutex`, backed by this crate's own `critical_section::Impl` (see
-/// `crate::critical_section_impl`), so every consumer of `mc1322x-hal` — not just this
-/// module — gets a working provider without extra wiring.
-static WAKER: Mutex<RefCell<Option<Waker>>> = Mutex::new(RefCell::new(None));
+/// and woken by [`i2c_isr`] the next time the module raises the interrupt.
+static WAKER: WakerCell = WakerCell::new();
 
 /// I2C master error.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -66,14 +60,29 @@ impl i2c::Error for Error {
 pub struct I2c0;
 
 impl I2c0 {
+    /// `I2C_FDR[5:0]` divider index (RM Table 14-5) measured at ~150 kHz SCL on the board
+    /// selected at compile time (`crate::board::I2C_CLOCK_DIVIDER` - see `crate::board`'s doc
+    /// comment) - a starting point for [`Self::new`], not a guaranteed rate: the real-world
+    /// frequency this produces also depends on bus loading and pull-up strength, which vary
+    /// even between boards using the same divider index, so this is a per-use parameter to
+    /// [`Self::new`] rather than something applied automatically the way [`crate::power::
+    /// trim_xtal`]'s board-selected trim is.
+    pub const BOARD_CLOCK_DIVIDER: u8 = crate::board::I2C_CLOCK_DIVIDER;
+
     /// Enable the I2C module, mux the SDA/SCL pads to their I2C function and
     /// activate the internal pull-ups, then return a master-ready instance.
-    pub fn new() -> Self {
+    ///
+    /// `clock_divider` is the raw `I2C_FDR[5:0]` index selecting the SCL/sampling-rate ratio
+    /// (RM Table 14-5) - this module has no closed-form frequency-to-divider formula (unlike
+    /// [`crate::spi::Spi::new`]'s simple power-of-two divisor), so this takes the index
+    /// directly rather than a target Hz. [`Self::BOARD_CLOCK_DIVIDER`] is a known-working
+    /// starting point on the currently selected board.
+    pub fn new(clock_divider: u8) -> Self {
         unsafe {
             // gate the clock to the I2C module
             write_u8(I2C_CKER, I2C_CKEN as u8);
             // SCL frequency divider
-            write_u8(I2C_FDR, I2C_CLOCK_DIVIDER);
+            write_u8(I2C_FDR, clock_divider);
             // our own (unused, master-only) slave address
             write_u8(I2C_ADR, 0x01);
             // enable the module; auto-ack on, no interrupts
@@ -156,7 +165,7 @@ impl I2c0 {
                 if let Poll::Ready(result) = self.poll_byte_status() {
                     return Poll::Ready(result);
                 }
-                *WAKER.borrow(cs).borrow_mut() = Some(cx.waker().clone());
+                WAKER.set(cs, cx.waker());
                 unsafe {
                     write_u8(I2C_CR, read_u8(I2C_CR) | I2C_MIEN as u8);
                 }
@@ -376,12 +385,6 @@ impl I2c0 {
     }
 }
 
-impl Default for I2c0 {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl ErrorType for I2c0 {
     type Error = Error;
 }
@@ -499,10 +502,8 @@ unsafe fn write_u8(reg: *mut u8, value: u8) {
 /// terminate rather than re-entering this handler forever — and wakes whichever task armed
 /// the wait.
 ///
-/// A [`Waker`] left behind by a cancelled (dropped) async I2C future is woken here like any
-/// other; that's a harmless no-op on a well-behaved executor, not a use-after-free, since
-/// [`Waker::wake`] on a waker whose task no longer exists is required by the `core` contract
-/// to do nothing.
+/// See [`crate::util::WakerCell::wake`] for why waking a waker left behind by a cancelled
+/// (dropped) async I2C future is harmless.
 ///
 /// This handler is *unconditionally* linked into any binary that depends on `mc1322x-hal`,
 /// whether or not it ever constructs an [`I2c0`]: `libmc1322x`'s `irq()` (statically linked
@@ -523,9 +524,5 @@ extern "C" fn i2c_isr() {
     unsafe {
         write_u8(I2C_CR, read_u8(I2C_CR) & !(I2C_MIEN as u8));
     }
-    critical_section::with(|cs| {
-        if let Some(waker) = WAKER.borrow(cs).borrow_mut().take() {
-            waker.wake();
-        }
-    });
+    WAKER.wake();
 }

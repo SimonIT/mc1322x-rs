@@ -95,21 +95,19 @@ const DIGITS: &[u8; 16] = b"0123456789abcdef";
 fn arm_main() -> ! {
     use embedded_io::Write;
     use embedded_storage::nor_flash::{NorFlash, ReadNorFlash};
-    use mc1322x_hal::nvm::{Nvm, NvmInterface};
+    use mc1322x_hal::nvm::Nvm;
     use mc1322x_hal::uart::{Uart, UartId};
 
     let mut uart = Uart::new(UartId::Uart1, BAUD);
     let _ = uart.write_all(b"UART_OK\r\n");
 
     // Regulator power-up and ROM secure-variable clear (both required before any `nvm_*` ROM
-    // call) live in `Nvm::new_assume_sst`/`Nvm::new` - see `mc1322x_hal::nvm` for why.
-    //
-    // On these particular Econotag boards the serial flash is wired to the *Internal* NVM
-    // interface, not External (GPIO4-7): External read back a floating-bus pattern (0x00,
-    // consistent but not real data) that made `erase`/`read` falsely report success while
-    // `write`'s internal verify step caught the mismatch (`gNvmErrVerifyError_c`). Internal
-    // reads back proper 0xFF post-erase and verifies real writes correctly.
-    let mut nvm = Nvm::new_assume_sst(NvmInterface::Internal);
+    // call) live in `Nvm::new_assume_sst`/`Nvm::new` - see `mc1322x_hal::nvm` for why. Which
+    // NVM interface (internal vs. external) to use is a fixed board-wiring property, so it's
+    // no longer a parameter here - it comes from mc1322x-hal's own `board-*` Cargo feature
+    // selection (`crate::board::NVM_INTERFACE`; see `mc1322x_hal::nvm::NvmInterface`'s doc
+    // comment for the hardware evidence behind that choice).
+    let mut nvm = Nvm::new_assume_sst();
     let _ = uart.write_all(b"NVM_READY\r\n");
     let mut probe = [0u8; 16];
     let _ = uart.write_all(b"READING\r\n");

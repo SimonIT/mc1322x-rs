@@ -1,30 +1,42 @@
-use core::cell::RefCell;
 use core::convert::Infallible;
-use core::task::{Poll, Waker};
-use critical_section::Mutex;
+use core::task::Poll;
 use embedded_io::{ErrorType, Read, Write};
 use mc1322x_sys::{
     INTBASE, UART_struct, UART1_BASE, UART2_BASE, UCON, UDATA, URXCON, USTAT, UTXCON,
     gpio_select_function, gpio_set_pad_dir, uart_flowctl, uart_setbaud,
 };
 
-const UCON_TXE: u32 = 1 << 0;
-const UCON_RXE: u32 = 1 << 1;
-// `MTXR`/`MRXR` (RM 11.5.1.4, UART_CON bits 13/14) *mask* the TX-ready/RX-ready interrupt
-// sources: 1 = masked (off). This is the opposite polarity of `TXE`/`RXE` above, so both
-// must be set at init time to keep the async path's interrupts quiescent until armed (see
-// [`Uart::wait_rx_ready`]/[`Uart::wait_tx_ready`]) — otherwise the reset-value-0 mask bits
-// leave the (already latched, see [`FIFO_WATERMARK`]) TX-ready condition unmasked, and once
-// [`Uart::new`] routes the interrupt through the ITC it fires immediately and forever.
-const UCON_MTXR: u32 = 1 << 13;
-const UCON_MRXR: u32 = 1 << 14;
+use crate::util::WakerCell;
 
-// UART_STAT bits 6/7 (RM 11.5.1.5): level-triggered "FIFO has crossed its watermark" flags,
-// set by hardware whenever `rx_count()`/`tx_free()` cross the level last written to
-// `URXCON`/`UTXCON`. Unlike I2C's `I2C_MIF`, nothing here needs to be cleared by software:
-// the condition self-clears as soon as the FIFO count no longer satisfies the watermark.
-const USTAT_RXRDY: u32 = 1 << 6;
-const USTAT_TXRDY: u32 = 1 << 7;
+bitflags::bitflags! {
+    /// `UART_CON` bits (RM 11.5.1.4).
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    struct Ucon: u32 {
+        const TXE = 1 << 0;
+        const RXE = 1 << 1;
+        // `MTXR`/`MRXR` *mask* the TX-ready/RX-ready interrupt sources: 1 = masked (off). This
+        // is the opposite polarity of `TXE`/`RXE` above, so both must be set at init time to
+        // keep the async path's interrupts quiescent until armed (see
+        // [`Uart::wait_rx_ready`]/[`Uart::wait_tx_ready`]) — otherwise the reset-value-0 mask
+        // bits leave the (already latched, see [`FIFO_WATERMARK`]) TX-ready condition
+        // unmasked, and once [`Uart::new`] routes the interrupt through the ITC it fires
+        // immediately and forever.
+        const MTXR = 1 << 13;
+        const MRXR = 1 << 14;
+    }
+}
+
+bitflags::bitflags! {
+    /// `UART_STAT` bits 6/7 (RM 11.5.1.5): level-triggered "FIFO has crossed its watermark"
+    /// flags, set by hardware whenever `rx_count()`/`tx_free()` cross the level last written to
+    /// `URXCON`/`UTXCON`. Unlike I2C's `I2C_MIF`, nothing here needs to be cleared by software:
+    /// the condition self-clears as soon as the FIFO count no longer satisfies the watermark.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    struct Ustat: u32 {
+        const RXRDY = 1 << 6;
+        const TXRDY = 1 << 7;
+    }
+}
 
 // `URXCON`/`UTXCON` are dual-purpose (see `libmc1322x`'s `uart.c`): a write latches the
 // watermark used for `USTAT_RXRDY`/`USTAT_TXRDY`, while a read (as in `rx_count`/`tx_free`
@@ -59,19 +71,17 @@ const TX_FIFO_DEPTH: u32 = 32;
 ///
 /// RX and TX are independent FIFOs, so a pending read and a pending write can be armed at
 /// the same time; each gets its own slot. One instance per physical UART, since both can be
-/// in use concurrently. Guarded by `critical_section`'s `Mutex`, backed by this crate's own
-/// `critical_section::Impl` (see `crate::critical_section_impl`) — see `crate::i2c`'s
-/// `WAKER` for why that's safe to rely on unconditionally.
+/// in use concurrently.
 struct UartWakers {
-    rx: Mutex<RefCell<Option<Waker>>>,
-    tx: Mutex<RefCell<Option<Waker>>>,
+    rx: WakerCell,
+    tx: WakerCell,
 }
 
 impl UartWakers {
     const fn new() -> Self {
         Self {
-            rx: Mutex::new(RefCell::new(None)),
-            tx: Mutex::new(RefCell::new(None)),
+            rx: WakerCell::new(),
+            tx: WakerCell::new(),
         }
     }
 }
@@ -138,7 +148,10 @@ impl Uart {
         // quiescent until `wait_rx_ready`/`wait_tx_ready` explicitly arm them; the
         // blocking `Read`/`Write` impls below never touch these bits.
         unsafe {
-            uart.write_reg(UCON, UCON_TXE | UCON_RXE | UCON_MTXR | UCON_MRXR);
+            uart.write_reg(
+                UCON,
+                (Ucon::TXE | Ucon::RXE | Ucon::MTXR | Ucon::MRXR).bits(),
+            );
             uart.write_reg(URXCON, FIFO_WATERMARK);
             uart.write_reg(UTXCON, FIFO_WATERMARK);
         }
@@ -221,9 +234,9 @@ impl Uart {
                 if self.rx_count() > 0 {
                     return Poll::Ready(());
                 }
-                *self.wakers().rx.borrow(cs).borrow_mut() = Some(cx.waker().clone());
+                self.wakers().rx.set(cs, cx.waker());
                 unsafe {
-                    self.write_reg(UCON, self.read_reg(UCON) & !UCON_MRXR);
+                    self.write_reg(UCON, self.read_reg(UCON) & !Ucon::MRXR.bits());
                 }
                 Poll::Pending
             })
@@ -238,9 +251,9 @@ impl Uart {
                 if self.tx_free() > 0 {
                     return Poll::Ready(());
                 }
-                *self.wakers().tx.borrow(cs).borrow_mut() = Some(cx.waker().clone());
+                self.wakers().tx.set(cs, cx.waker());
                 unsafe {
-                    self.write_reg(UCON, self.read_reg(UCON) & !UCON_MTXR);
+                    self.write_reg(UCON, self.read_reg(UCON) & !Ucon::MTXR.bits());
                 }
                 Poll::Pending
             })
@@ -355,36 +368,28 @@ impl embedded_io_async::Write for Uart {
 /// `irq()`'s dispatch loop can terminate rather than re-entering this handler forever — and
 /// wakes whichever task armed the wait.
 ///
-/// A [`Waker`] left behind by a cancelled (dropped) async read/write future is woken here
-/// like any other; that's a harmless no-op on a well-behaved executor, not a use-after-free,
-/// since [`Waker::wake`] on a waker whose task no longer exists is required by the `core`
-/// contract to do nothing.
+/// See [`crate::util::WakerCell::wake`] for why waking a waker left behind by a cancelled
+/// (dropped) async read/write future is harmless.
 fn uart_isr_common(uart: *mut UART_struct, wakers: &UartWakers) {
-    let stat = unsafe { read_reg_raw(uart, USTAT) };
-    let mut mask = 0;
-    if stat & USTAT_RXRDY != 0 {
-        mask |= UCON_MRXR;
+    let stat = Ustat::from_bits_truncate(unsafe { read_reg_raw(uart, USTAT) });
+    let mut mask = Ucon::empty();
+    if stat.contains(Ustat::RXRDY) {
+        mask |= Ucon::MRXR;
     }
-    if stat & USTAT_TXRDY != 0 {
-        mask |= UCON_MTXR;
+    if stat.contains(Ustat::TXRDY) {
+        mask |= Ucon::MTXR;
     }
-    if mask != 0 {
+    if !mask.is_empty() {
         unsafe {
-            write_reg_raw(uart, UCON, read_reg_raw(uart, UCON) | mask);
+            write_reg_raw(uart, UCON, read_reg_raw(uart, UCON) | mask.bits());
         }
     }
-    critical_section::with(|cs| {
-        if stat & USTAT_RXRDY != 0
-            && let Some(waker) = wakers.rx.borrow(cs).borrow_mut().take()
-        {
-            waker.wake();
-        }
-        if stat & USTAT_TXRDY != 0
-            && let Some(waker) = wakers.tx.borrow(cs).borrow_mut().take()
-        {
-            waker.wake();
-        }
-    });
+    if stat.contains(Ustat::RXRDY) {
+        wakers.rx.wake();
+    }
+    if stat.contains(Ustat::TXRDY) {
+        wakers.tx.wake();
+    }
 }
 
 /// UART1 RX/TX-ready interrupt handler.

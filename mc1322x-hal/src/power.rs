@@ -2,29 +2,54 @@
 
 use mc1322x_sys::CRM_BASE;
 
-/// Trim the 24 MHz reference crystal oscillator to the board's calibrated frequency.
+/// `CRM_XTAL_CNTL` trim values for the 24 MHz reference crystal oscillator (see [`trim_xtal`]).
 ///
-/// Replicates `trim_xtal()` (`mc1322x-sys/libmc1322x/src/default_lowlevel.h`'s
-/// `pack_XTAL_CNTL(CTUNE_4PF, CTUNE, FTUNE, IBIAS)` macro) for the Redbee Econotag board (the
-/// only board this workspace targets - see `board/redbee-econotag.h`'s `CTUNE_4PF`/`CTUNE`/
-/// `FTUNE`, and `board/std_conf.h`'s `IBIAS` default, which Econotag doesn't override).
+/// These compensate for the specific crystal and its board-level load capacitance, so they are
+/// a per-board calibration, not chip behavior - each board gets its own preset in its own file
+/// under `src/board/` (see `crate::board`'s doc comment), one of which is selected at compile
+/// time by a `board-*` Cargo feature.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub(crate) struct XtalTrim {
+    pub ctune_4pf: u32,
+    pub ctune: u32,
+    pub ftune: u32,
+    pub ibias: u32,
+}
+
+impl XtalTrim {
+    /// Pack into the raw `CRM_XTAL_CNTL` value [`trim_xtal`] writes. A `const fn` (rather than
+    /// a plain method) so [`BOARD_XTAL_CNTL`] below can fold this - the shifts, ORs and all -
+    /// into a single compile-time constant: since the board's trim never changes at runtime,
+    /// there's nothing left for `trim_xtal` to compute, only one constant to write.
+    const fn pack(self) -> u32 {
+        (self.ctune_4pf << 25) | (self.ctune << 21) | (self.ftune << 16) | (self.ibias << 8) | 0x52
+    }
+}
+
+/// [`crate::board::XTAL_TRIM`] (the board selected at compile time - see `crate::board`'s doc
+/// comment), pre-packed at compile time (see [`XtalTrim::pack`]) into the exact value
+/// [`trim_xtal`] writes verbatim - not just *which* board's trim is selected, but the register
+/// value itself, is fully resolved before this ever runs.
+pub(crate) const BOARD_XTAL_CNTL: u32 = crate::board::XTAL_TRIM.pack();
+
+/// Trim the 24 MHz reference crystal oscillator to [`BOARD_XTAL_CNTL`].
+///
+/// This chip-level operation (a single `CRM_XTAL_CNTL` register write) applies to any MC1322x
+/// board; only the packed value itself is board-specific - see [`XtalTrim`] and the `board-*`
+/// Cargo features that select it.
 ///
 /// Every radio-using program in `libmc1322x`'s own `tests/` (`rftest-tx`, `rftest-rx`,
 /// `autoack-tx`, `autoack-rx`, ...) and Contiki's own `redbee-econotag` platform
-/// (`init_lowlevel()` in `contiki-mc1322x-main.c`) calls this unconditionally as one of the very
-/// first steps of `main`, before `maca_init()` - this workspace's own boot path never did. An
-/// untrimmed crystal is an out-of-spec reference clock for the MACA's PLL frequency synthesizer;
-/// this is the prime suspect for a MACA status 12 (`PLL_UNLOCK`) reliably seen on the very first
-/// real transmit (see the `maca_tx_pll_unlock_runaway` project memory).
+/// (`init_lowlevel()` in `contiki-mc1322x-main.c`) calls the equivalent of this unconditionally
+/// as one of the very first steps of `main`, before `maca_init()` - this workspace's own boot
+/// path never did. An untrimmed crystal is an out-of-spec reference clock for the MACA's PLL
+/// frequency synthesizer; this is the prime suspect for a MACA status 12 (`PLL_UNLOCK`)
+/// reliably seen on the very first real transmit (see the `maca_tx_pll_unlock_runaway` project
+/// memory) - true for any board using the MACA, not just the one this crate has verified.
 pub(crate) fn trim_xtal() {
-    const CTUNE_4PF: u32 = 1;
-    const CTUNE: u32 = 11;
-    const FTUNE: u32 = 7;
-    const IBIAS: u32 = 0x1F;
-
     unsafe {
         let xtal_cntl = (CRM_BASE + 0x40) as *mut u32;
-        xtal_cntl.write_volatile((CTUNE_4PF << 25) | (CTUNE << 21) | (FTUNE << 16) | (IBIAS << 8) | 0x52);
+        xtal_cntl.write_volatile(BOARD_XTAL_CNTL);
     }
 }
 

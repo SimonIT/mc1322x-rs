@@ -37,16 +37,19 @@ const CAPACITY: usize = SECTOR_COUNT * SECTOR_SIZE;
 /// The MC1322x has no on-die flash: `nvm_detect`/`nvm_read`/`nvm_write`/`nvm_erase` are boot
 /// ROM routines that bit-bang a serial flash chip, wired either to the chip's internal
 /// interface or brought out to external pins (sharing GPIO4-7 with [`crate::spi::Spi`]),
-/// depending on the board.
+/// depending on the board - a fixed property of the board's own PCB design, not a runtime
+/// choice, which is why [`Nvm::new`]/[`Nvm::new_assume_sst`] use the one a `board-*` Cargo
+/// feature selects (`crate::board::NVM_INTERFACE`) rather than taking it as a parameter.
 ///
 /// Picking the wrong one doesn't necessarily fail loudly: against a floating/unconnected bus,
 /// `nvm_detect`/`nvm_read`/`nvm_erase` can read back a consistent-but-fake pattern and report
 /// success, since none of them compare against expected data. `nvm_write`'s internal verify
 /// step is usually the first thing to actually notice, failing with [`Error::Rom`] wrapping
 /// `gNvmErrVerifyError_c`. Confirm against real hardware behavior (a write+read-back round
-/// trip, not just a read), not board documentation, when porting to a new board - on the
-/// Redbee Econotag boards this driver targets, `Internal` is correct despite `External`
-/// superficially "working" for detect/read/erase.
+/// trip, not just a read), not board documentation, when porting to a new board (see
+/// `crate::board`'s doc comment) - on the Redbee Econotag, the only board this has been
+/// hardware-verified against so far, `Internal` is correct despite `External` superficially
+/// "working" for detect/read/erase.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum NvmInterface {
     /// The internal NVM interface (`gNvmInternalInterface_c`).
@@ -109,15 +112,16 @@ pub struct Nvm {
 }
 
 impl Nvm {
-    /// Detect the flash chip on `interface`.
+    /// Detect the flash chip on the board's [`NvmInterface`] (`crate::board::NVM_INTERFACE`,
+    /// selected at compile time - see that constant's doc comment).
     ///
     /// # Errors
     ///
     /// Returns [`Error::UnsupportedFlash`] if `nvm_detect` finds no chip, or one that isn't
     /// the SST-compatible part this type assumes.
-    pub fn new(interface: NvmInterface) -> Result<Self, Error> {
+    pub fn new() -> Result<Self, Error> {
         prepare_flash_access();
-        let interface = interface.as_raw();
+        let interface = crate::board::NVM_INTERFACE.as_raw();
         let mut nvm_type: nvmType_t = 0;
         let err = unsafe {
             nvm_detect.expect("nvm_detect ROM entry point missing")(interface, &mut nvm_type)
@@ -132,17 +136,17 @@ impl Nvm {
         })
     }
 
-    /// Construct an `Nvm` for `interface` assuming the SST-compatible geometry, without calling
-    /// the ROM's `nvm_detect` at all.
+    /// Construct an `Nvm` on the board's [`NvmInterface`] assuming the SST-compatible
+    /// geometry, without calling the ROM's `nvm_detect` at all.
     ///
     /// Diagnostic escape hatch for boards/situations where `nvm_detect` itself hangs or faults
     /// (observed when this driver is exercised from code loaded directly into RAM over JTAG,
     /// bypassing the chip's normal boot sequence) - skips straight to the same SST type
     /// [`Self::new`] would use anyway if detection succeeded.
-    pub fn new_assume_sst(interface: NvmInterface) -> Self {
+    pub fn new_assume_sst() -> Self {
         prepare_flash_access();
         Self {
-            interface: interface.as_raw(),
+            interface: crate::board::NVM_INTERFACE.as_raw(),
             nvm_type: nvmType_t_gNvmType_SST_c,
         }
     }

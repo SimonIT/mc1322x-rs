@@ -2,8 +2,10 @@
 name = "mc1322x-hal"
 version = "0.1.0"
 edition = "2024"
+description = "embedded-hal HAL for the NXP/Freescale MC1322x chip family (MC13224V/MC13226V), for any board built around either part"
 
 [dependencies]
+bitflags = "2"
 critical-section = { version = "1.2", features = ["restore-state-u32"] }
 embedded-cal = { git = "https://github.com/lake-rs/embedded-cal" }
 embedded-hal = "1.0.0"
@@ -14,8 +16,11 @@ embedded-storage = "0.3.1"
 embedded-time = { version = "0.12.1", optional = true }
 fugit = { version = "0.5.0", optional = true }
 mc1322x-sys = { path = "../mc1322x-sys" }
+portable-atomic = { version = "1.5", features = ["critical-section"] }
 rand_core = { version = "0.10.1", default-features = false }
 
 [features]
+default = ["board-redbee-econotag"]
+board-redbee-econotag = []
 fugit = ["dep:fugit"]
 embedded-time = ["dep:embedded-time"]

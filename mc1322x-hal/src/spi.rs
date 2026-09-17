@@ -1,9 +1,9 @@
-use core::cell::RefCell;
 use core::convert::Infallible;
-use core::task::{Poll, Waker};
-use critical_section::Mutex;
+use core::task::Poll;
 use embedded_hal::spi::{self, SpiBus};
 use mc1322x_sys::{INTBASE, REF_OSC, gpio_select_function, gpio_set_pad_dir};
+
+use crate::util::WakerCell;
 
 const SPI_BASE: usize = 0x8000_2000;
 
@@ -58,11 +58,9 @@ const INT_NUM_SPI: u32 = 10;
 ///
 /// Set (with the ITC's SPI channel armed) by `transfer_word_async` before it returns
 /// `Pending`, and taken and woken by [`spi_isr`] the next time the module raises the
-/// interrupt. Guarded by `critical_section`'s `Mutex`, backed by this crate's own
-/// `critical_section::Impl` (see `crate::critical_section_impl`) — see `crate::i2c`'s `WAKER`
-/// for why that's safe to rely on unconditionally. A single instance suffices: unlike UART's
-/// independent RX/TX FIFOs, this crate's SPI driver only ever has one transfer in flight.
-static WAKER: Mutex<RefCell<Option<Waker>>> = Mutex::new(RefCell::new(None));
+/// interrupt. A single instance suffices: unlike UART's independent RX/TX FIFOs, this crate's
+/// SPI driver only ever has one transfer in flight.
+static WAKER: WakerCell = WakerCell::new();
 
 /// SPI bus clock mode.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -172,7 +170,7 @@ impl Spi {
                 if let Poll::Ready(rx) = self.poll_transfer_status() {
                     return Poll::Ready(rx);
                 }
-                *WAKER.borrow(cs).borrow_mut() = Some(cx.waker().clone());
+                WAKER.set(cs, cx.waker());
                 unsafe {
                     core::ptr::write_volatile((INTBASE + INTENNUM_OFF) as *mut u32, INT_NUM_SPI);
                 }
@@ -287,10 +285,8 @@ impl embedded_hal_async::spi::SpiBus<u8> for Spi {
 /// interrupt line so `irq()`'s dispatch loop can terminate rather than re-entering this
 /// handler forever — and wakes whichever task armed the wait.
 ///
-/// A [`Waker`] left behind by a cancelled (dropped) async transfer future is woken here like
-/// any other; that's a harmless no-op on a well-behaved executor, not a use-after-free, since
-/// [`Waker::wake`] on a waker whose task no longer exists is required by the `core` contract
-/// to do nothing.
+/// See [`crate::util::WakerCell::wake`] for why waking a waker left behind by a cancelled
+/// (dropped) async transfer future is harmless.
 ///
 /// # Caveats
 ///
@@ -300,9 +296,5 @@ extern "C" fn spi_isr() {
     unsafe {
         core::ptr::write_volatile((INTBASE + INTDISNUM_OFF) as *mut u32, INT_NUM_SPI);
     }
-    critical_section::with(|cs| {
-        if let Some(waker) = WAKER.borrow(cs).borrow_mut().take() {
-            waker.wake();
-        }
-    });
+    WAKER.wake();
 }

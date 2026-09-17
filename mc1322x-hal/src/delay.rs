@@ -1,9 +1,9 @@
-use core::cell::RefCell;
 use core::hint::black_box;
-use core::task::{Poll, Waker};
-use critical_section::Mutex;
+use core::task::Poll;
 use embedded_hal::delay::DelayNs;
 use mc1322x_sys::{CRM_BASE, INTBASE, REF_OSC, rtc_delay_ms, rtc_freq, rtc_init_osc};
+
+use crate::util::WakerCell;
 
 // ITC (interrupt controller) offset/number for the CRM interrupt (`rtc_isr` is dispatched from
 // within `irq()`'s `INT_NUM_CRM` block - see `isr.h`'s `INTENNUM_OFF` and `interrupt_nums`),
@@ -37,10 +37,8 @@ const RTC_WU_EVT: u32 = 1 << 3;
 /// The RTC wake-up comparator (`WU_CNTL.RTC_WU_EN`/`RTC_TIMEOUT`/`STATUS.RTC_WU_EVT`) is a
 /// single shared hardware resource: don't run two [`Delay`] instances' async `delay_ms`
 /// concurrently, and don't mix this with [`crate::sleep::sleep`]'s RTC wake source — both
-/// would fight over the same registers. Guarded by `critical_section`'s `Mutex`, backed by
-/// this crate's own `critical_section::Impl` (see `crate::critical_section_impl`) — see
-/// `crate::i2c`'s `WAKER` for why that's safe to rely on unconditionally.
-static WAKER: Mutex<RefCell<Option<Waker>>> = Mutex::new(RefCell::new(None));
+/// would fight over the same registers.
+static WAKER: WakerCell = WakerCell::new();
 
 #[inline]
 unsafe fn read_reg(reg: *mut u32) -> u32 {
@@ -133,7 +131,7 @@ impl Delay {
                     if unsafe { read_reg(STATUS) } & RTC_WU_EVT != 0 {
                         return Poll::Ready(());
                     }
-                    *WAKER.borrow(cs).borrow_mut() = Some(cx.waker().clone());
+                    WAKER.set(cs, cx.waker());
                     unsafe {
                         write_reg(WU_CNTL, read_reg(WU_CNTL) | RTC_WU_EN | RTC_WU_IEN);
                     }
@@ -226,9 +224,5 @@ extern "C" fn rtc_isr() {
     unsafe {
         write_reg(WU_CNTL, read_reg(WU_CNTL) & !RTC_WU_IEN);
     }
-    critical_section::with(|cs| {
-        if let Some(waker) = WAKER.borrow(cs).borrow_mut().take() {
-            waker.wake();
-        }
-    });
+    WAKER.wake();
 }

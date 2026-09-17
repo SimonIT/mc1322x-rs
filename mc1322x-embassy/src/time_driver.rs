@@ -30,6 +30,7 @@
 //! and must be validated on hardware.
 
 use core::cell::{Cell, RefCell};
+use core::sync::atomic::Ordering;
 use core::task::Waker;
 
 use critical_section::Mutex;
@@ -39,6 +40,7 @@ use mc1322x_sys::{
     INTBASE, TMR_REGOFF_CNTR, TMR_REGOFF_COMP1, TMR_REGOFF_CSCTRL, TMR_REGOFF_CTRL,
     TMR_REGOFF_ENBL, TMR_REGOFF_SCTRL, TMR0_BASE,
 };
+use portable_atomic::AtomicBool;
 
 /// Reference oscillator frequency (Hz).
 const REF_OSC_HZ: u32 = 24_000_000;
@@ -82,7 +84,7 @@ struct TmrDriver {
     /// Pending timers.
     queue: Mutex<RefCell<Queue>>,
     /// Whether `init()` has run.
-    started: Mutex<Cell<bool>>,
+    started: AtomicBool,
 }
 
 impl TmrDriver {
@@ -91,7 +93,7 @@ impl TmrDriver {
             base: Mutex::new(Cell::new(0)),
             last_boundary: Mutex::new(Cell::new(0)),
             queue: Mutex::new(RefCell::new(Queue::new())),
-            started: Mutex::new(Cell::new(false)),
+            started: AtomicBool::new(false),
         }
     }
 }
@@ -124,46 +126,38 @@ impl Driver for TmrDriver {
 /// It must be called once, with interrupts in a known state, before using `embassy-time`.
 /// [`crate::init`] does this.
 pub fn init() {
-    let already_started = critical_section::with(|cs| {
-        let started = DRIVER.started.borrow(cs);
-        if started.get() {
-            return true;
-        }
-        started.set(true);
-
-        unsafe {
-            // Reset the timer first.
-            write16(TMR_REGOFF_ENBL, 0);
-            write16(TMR_REGOFF_SCTRL, 0);
-            // Enable the compare-1 interrupt and clear the compare flag (mirrors tmr-ints.c).
-            write16(TMR_REGOFF_CSCTRL, 0x0040);
-            write16(TMR_REGOFF_CNTR, 0);
-
-            // CTRL = COUNT_MODE=1 (count rising edges of primary source)
-            //      | PRIMARY_CNT_SOURCE=8+PRESCALE_SHIFT (prescaler /2.pow(PRESCALE_SHIFT))
-            //      | LENGTH=0 (free-running)
-            write16(
-                TMR_REGOFF_CTRL,
-                (1 << 13) | ((8 + PRESCALE_SHIFT as u16) << 9),
-            );
-
-            // Free-run counter, armed to fire every PERIOD counts.
-            let boundary = read16(TMR_REGOFF_CNTR);
-            DRIVER.last_boundary.borrow(cs).set(boundary);
-            write16(TMR_REGOFF_COMP1, boundary.wrapping_add(PERIOD as u16));
-
-            // Enable TMR0. `TMR_ENBL` is a single shared register for all four TMR channels
-            // ("one enable register to rule them all", per libmc1322x's tmr.h) - the reference
-            // `tmr-ints.c` test writes 0xf (all four channels) rather than just this channel's
-            // bit; matching that here mattered on real hardware (bit 0 alone left the counter
-            // not running).
-            write16(TMR_REGOFF_ENBL, 0x0f);
-        }
-        false
-    });
-    if already_started {
+    if DRIVER.started.swap(true, Ordering::AcqRel) {
         return;
     }
+
+    critical_section::with(|cs| unsafe {
+        // Reset the timer first.
+        write16(TMR_REGOFF_ENBL, 0);
+        write16(TMR_REGOFF_SCTRL, 0);
+        // Enable the compare-1 interrupt and clear the compare flag (mirrors tmr-ints.c).
+        write16(TMR_REGOFF_CSCTRL, 0x0040);
+        write16(TMR_REGOFF_CNTR, 0);
+
+        // CTRL = COUNT_MODE=1 (count rising edges of primary source)
+        //      | PRIMARY_CNT_SOURCE=8+PRESCALE_SHIFT (prescaler /2.pow(PRESCALE_SHIFT))
+        //      | LENGTH=0 (free-running)
+        write16(
+            TMR_REGOFF_CTRL,
+            (1 << 13) | ((8 + PRESCALE_SHIFT as u16) << 9),
+        );
+
+        // Free-run counter, armed to fire every PERIOD counts.
+        let boundary = read16(TMR_REGOFF_CNTR);
+        DRIVER.last_boundary.borrow(cs).set(boundary);
+        write16(TMR_REGOFF_COMP1, boundary.wrapping_add(PERIOD as u16));
+
+        // Enable TMR0. `TMR_ENBL` is a single shared register for all four TMR channels
+        // ("one enable register to rule them all", per libmc1322x's tmr.h) - the reference
+        // `tmr-ints.c` test writes 0xf (all four channels) rather than just this channel's
+        // bit; matching that here mattered on real hardware (bit 0 alone left the counter
+        // not running).
+        write16(TMR_REGOFF_ENBL, 0x0f);
+    });
 
     // Enable the TMR interrupt in the ITC - deliberately *outside* the critical section above:
     // this crate's `critical_section` impl (`mc1322x_hal::critical_section_impl`) saves
