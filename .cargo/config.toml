@@ -8,4 +8,45 @@ build-std = ["core"]
 rustflags = [
   "-Clinker=arm-none-eabi-ld",                       # uses the ARM linker
   "-Clink-arg=-Tmc1322x-sys/libmc1322x/mc1322x.lds", # sets the link script
+  # `compiler_builtins` always contributes a *weak* `__aeabi_*` integer div/mod definition as
+  # part of a codegen-unit object that gets linked in regardless (for unrelated symbols in the
+  # same unit), so it's never "lazily skipped" the way a plain archive member would be - plain
+  # `-lgcc` on its own never even gets a chance to provide its strong, real, ARM7TDMI-native
+  # 32-bit division routines instead (see the `toolchain_upgrade_breakage_fixed` project memory
+  # for the hardware-confirmed crash this caused). Force-linking these two specific,
+  # verified-Thumb-only objects (rather than `--whole-archive`-ing the whole of libgcc.a)
+  # supplies real division for 32-bit `__aeabi_uidiv`/`__aeabi_idiv`/*_divmod, while
+  # deliberately NOT pulling in libgcc's 64-bit division helpers
+  # (`__aeabi_uldivmod`/`__aeabi_ldivmod`): those are ARM-mode (not Thumb) code in this
+  # toolchain's multilib and need a `BLX (immediate)` interworking veneer that plain ARMv4T
+  # silicon (no BLX instruction at all) cannot execute - a second, distinct, hardware-confirmed
+  # crash. `compiler_builtins`' pure-Rust, always-Thumb 64-bit division continues to serve those
+  # symbols instead, and never hits this problem. `mc1322x-sys`'s build script extracts these
+  # objects fresh from the installed toolchain's own `libgcc.a` into `.libgcc-thumbv4t/` (see its
+  # `extract_libgcc_objects`) rather than vendoring prebuilt copies, so the paths below always
+  # match whatever `arm-none-eabi-gcc` is actually installed.
+  "-Clink-arg=.libgcc-thumbv4t/_udivsi3.o",
+  "-Clink-arg=.libgcc-thumbv4t/_divsi3.o",
+  # `_udivsi3.o`/`_divsi3.o`'s division-by-zero path calls `__aeabi_idiv0` (weak): pulled in too
+  # so it resolves without depending on link-order luck with `compiler_builtins`' own weak
+  # definition of the same symbol (a plain object's undefined reference can only be satisfied
+  # by something already earlier in the link or explicitly provided here - archives placed
+  # later on the command line, like `compiler_builtins`' rlib normally would be, are not
+  # re-scanned for it).
+  "-Clink-arg=.libgcc-thumbv4t/_dvmd_tls.o",
+  # `__gnu_thumb1_case_*`: Thumb-1 jump-table helpers libgcc provides for C `switch` statements
+  # compiled from libmc1322x. `_uqi` is needed by `lib/pwm.c`'s `switch (timer_num)` (pulled into
+  # every binary that uses `mc1322x-hal::pwm`); `_sqi` is needed by `lib/printf.c` (not currently
+  # called from Rust, so not yet exercised in any built binary, but kept since `printf.o` sits in
+  # `libmc1322x.a` ready to be pulled in the moment something calls it, and would otherwise fail
+  # to link with a hard-to-place `undefined reference to __gnu_thumb1_case_sqi`). Of libgcc's five
+  # `__gnu_thumb1_case_*` variants (`_uqi`/`_sqi`/`_uhi`/`_shi`/`_si`), `_uhi`/`_shi`/`_si` were
+  # checked (via `nm` on every object in libmc1322x and every binary this workspace + its examples
+  # build) and found unreferenced anywhere in this codebase, so they're deliberately left out -
+  # add one back (via `extract_libgcc_objects`'s `members` array below too) only if a real link
+  # error asks for it. Also confirmed pure Thumb-1 (2-byte opcodes throughout), also linked
+  # individually rather than pulled from `-lgcc` for the same reason as the division objects
+  # above.
+  "-Clink-arg=.libgcc-thumbv4t/_thumb1_case_uqi.o",
+  "-Clink-arg=.libgcc-thumbv4t/_thumb1_case_sqi.o",
 ]

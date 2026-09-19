@@ -2,6 +2,7 @@
 name = "mc1322x-sys"
 version = "0.1.0"
 edition = "2024"
+description = "Raw FFI bindings to libmc1322x for the NXP/Freescale MC1322x chip family (MC13224V/MC13226V)"
 
 [dependencies]
 

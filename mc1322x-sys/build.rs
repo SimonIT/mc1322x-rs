@@ -93,16 +93,14 @@ fn main() {
     );
     println!("cargo:rustc-link-lib=c");
 
-    // `libmc1322x/lib/pwm.c`'s `switch` statements on `int timer_num` compile to Thumb-1
-    // jump-table lookups needing `__gnu_thumb1_case_uqi`, a libgcc helper - nothing else in
-    // this workspace pulls pwm.c's object into the link, so this only surfaced once
-    // `mc1322x-hal::pwm` was first actually exercised (`examples/pwm-selftest`).
-    let libgcc_path = arm_none_eabi_gcc_file(&multilib_flags, "libgcc.a");
-    println!(
-        "cargo:rustc-link-search=native={}",
-        libgcc_path.parent().unwrap().display()
-    );
-    println!("cargo:rustc-link-lib=gcc");
+    // A handful of specific libgcc objects (32-bit division; `libmc1322x/lib/pwm.c`'s Thumb-1
+    // `switch`-statement jump tables, first needed once `mc1322x-hal::pwm` was actually
+    // exercised) are needed as real, non-weak symbols rather than `compiler_builtins`' own weak
+    // fallbacks - see the root `.cargo/config.toml`'s rustflags comment for why, and why they're
+    // force-linked individually rather than via a plain `-lgcc`/`--whole-archive`. Extract them
+    // here from this toolchain's own `libgcc.a`, into a fixed path (not `$OUT_DIR`, which
+    // changes every build) so that static rustflags entry can name them directly.
+    extract_libgcc_objects(&multilib_flags);
 
     let bindings = bindgen::Builder::default()
         .header(header_str)
@@ -172,6 +170,43 @@ fn main() {
         .expect("Failed to create bindings.rs")
         .write_all(new_output.as_bytes())
         .expect("Failed to write to bindings.rs");
+}
+
+/// Extract the specific libgcc objects this workspace's root `.cargo/config.toml` force-links
+/// (see its rustflags comment) from this toolchain's own `libgcc.a`, into
+/// `<workspace root>/.libgcc-thumbv4t/` - a fixed, `.gitignore`d path outside `$OUT_DIR` so that
+/// static rustflags entry can reference them without needing to know a build-specific path.
+fn extract_libgcc_objects(multilib_flags: &[&str]) {
+    let libgcc_path = arm_none_eabi_gcc_file(multilib_flags, "libgcc.a");
+
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("mc1322x-sys is a direct child of the workspace root")
+        .to_path_buf();
+    let out_dir = workspace_root.join(".libgcc-thumbv4t");
+    std::fs::create_dir_all(&out_dir).expect("failed to create .libgcc-thumbv4t");
+
+    let members = [
+        "_udivsi3.o",
+        "_divsi3.o",
+        "_dvmd_tls.o",
+        "_thumb1_case_uqi.o",
+        "_thumb1_case_sqi.o",
+    ];
+    let output = Command::new("arm-none-eabi-ar")
+        .arg("x")
+        .arg(&libgcc_path)
+        .args(members)
+        .current_dir(&out_dir)
+        .output()
+        .expect("failed to run arm-none-eabi-ar");
+    assert!(
+        output.status.success(),
+        "arm-none-eabi-ar x {} failed:\nstdout: {}\nstderr: {}",
+        libgcc_path.display(),
+        std::str::from_utf8(&output.stdout).unwrap(),
+        std::str::from_utf8(&output.stderr).unwrap()
+    );
 }
 
 /// Ask `arm-none-eabi-gcc` where `file` (e.g. `libc.a`) lives for the given
