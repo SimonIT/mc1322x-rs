@@ -20,10 +20,14 @@
 //! why).
 //!
 //! For applications that want the CPU to actually enter CRM `Doze` between polls instead of
-//! busy-polling, [`sleepy_executor::SleepyExecutor`] is an opt-in alternative to the plain
+//! busy-polling, [`sleepy_executor::SleepyExecutor`] is an alternative to the plain
 //! `embassy_executor::Executor` above — see its module docs for what it is and isn't safe for
 //! (only pure-timer-plus-`mc1322x-hal`-async-peripheral workloads) and why it can't be combined
-//! with `platform-spin` in the same binary.
+//! with `platform-spin` in the same binary. It's opt-in via this crate's `sleepy-executor`
+//! Cargo feature (off by default) — genuinely opt-in, not just "don't call it": the feature
+//! gates the module's compilation entirely, so a consumer that leaves it off never emits the
+//! `Pender` registration that would otherwise conflict with `platform-spin` at link time
+//! whether or not `SleepyExecutor` is ever actually named in that consumer's own code.
 //!
 //! # Usage
 //!
@@ -59,6 +63,7 @@
 // not for any item this crate's own code calls.
 use mc1322x_hal as _;
 
+#[cfg(feature = "sleepy-executor")]
 pub mod sleepy_executor;
 pub mod time_driver;
 

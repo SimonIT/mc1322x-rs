@@ -4,6 +4,19 @@ version = "0.1.0"
 edition = "2024"
 description = "Embassy platform support for the NXP MC1322x"
 
+[features]
+# `SleepyExecutor` registers its own `Pender` (see `sleepy_executor.rs`) via `raw::Executor`
+# directly, using `pender_impl!` - which may only run once in the whole crate tree. Gating the
+# whole module behind this feature is load-bearing, not cosmetic: without it, `sleepy_executor`
+# would always be compiled in (even for a consumer that never names `SleepyExecutor`), and once
+# a binary pulls in anything else from this crate too (`init()`, `time_driver` - i.e. every real
+# consumer), the linker packs the unused `__pender` into the same link unit anyway and it
+# collides with `platform-spin`'s own `__pender` - hardware-confirmed as a real link error, not
+# a hypothetical. A binary that wants `SleepyExecutor` enables this feature and must not also
+# enable a `platform-*` feature (e.g. `platform-spin`) anywhere in its dependency graph; a binary
+# that leaves this feature off can use `platform-spin` freely.
+sleepy-executor = []
+
 [dependencies]
 critical-section = { version = "1.2", features = ["restore-state-u32"] }
 embassy-time = { version = "0.5", features = [
