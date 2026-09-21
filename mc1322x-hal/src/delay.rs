@@ -120,6 +120,10 @@ impl Delay {
         Self::ensure_crm_interrupt_enabled();
         let anchor = unsafe { RTC_COUNT.read_volatile() };
         let mut remaining = ticks.max(1);
+        // Held across every re-arm iteration below, not just one `poll_fn` call: see
+        // `crate::sleep::SleepInhibitGuard`'s doc comment for why a sleep-aware executor must
+        // not sleep for as long as this wait (on any iteration) is in flight.
+        let mut inhibit = None;
         loop {
             unsafe {
                 write_reg(WU_CNTL, read_reg(WU_CNTL) & !(RTC_WU_EN | RTC_WU_IEN));
@@ -131,6 +135,7 @@ impl Delay {
                     if unsafe { read_reg(STATUS) } & RTC_WU_EVT != 0 {
                         return Poll::Ready(());
                     }
+                    inhibit.get_or_insert_with(crate::sleep::SleepInhibitGuard::new);
                     WAKER.set(cs, cx.waker());
                     unsafe {
                         write_reg(WU_CNTL, read_reg(WU_CNTL) | RTC_WU_EN | RTC_WU_IEN);

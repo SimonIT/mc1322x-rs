@@ -85,6 +85,13 @@ struct TmrDriver {
     queue: Mutex<RefCell<Queue>>,
     /// Whether `init()` has run.
     started: AtomicBool,
+    /// Cached result of the queue's own `next_expiration` (`u64::MAX` if nothing is scheduled) -
+    /// recomputed every tick in [`TmrDriver::on_tick`], and speculatively tightened (never
+    /// loosened) by [`Driver::schedule_wake`] itself so a newly-scheduled, sooner deadline is
+    /// visible immediately rather than waiting up to one tick. Backs [`ticks_until_next_wake`],
+    /// which a sleep-aware executor (`mc1322x_embassy::SleepyExecutor`) uses to decide how long
+    /// it's safe to sleep.
+    next_alarm: Mutex<Cell<u64>>,
 }
 
 impl TmrDriver {
@@ -94,6 +101,7 @@ impl TmrDriver {
             last_boundary: Mutex::new(Cell::new(0)),
             queue: Mutex::new(RefCell::new(Queue::new())),
             started: AtomicBool::new(false),
+            next_alarm: Mutex::new(Cell::new(u64::MAX)),
         }
     }
 }
@@ -116,21 +124,23 @@ impl Driver for TmrDriver {
             // nothing to reprogram in hardware. `Queue::schedule_wake` also wakes wakers that
             // are already past due.
             queue.schedule_wake(at, waker);
+            // Tighten (never loosen) the cached next-alarm estimate immediately: `on_tick`
+            // will recompute the true value from the queue within one tick regardless, but a
+            // sleep-aware executor calling `ticks_until_next_wake` between now and then should
+            // still see this new, sooner deadline rather than a stale, larger one.
+            let next_alarm = self.next_alarm.borrow(cs);
+            next_alarm.set(next_alarm.get().min(at));
         })
     }
 }
 
-/// Initialize the time driver (idempotent).
-///
-/// This configures TMR0 for a 1 kHz compare interrupt and enables the TMR interrupt in the ITC.
-/// It must be called once, with interrupts in a known state, before using `embassy-time`.
-/// [`crate::init`] does this.
-pub fn init() {
-    if DRIVER.started.swap(true, Ordering::AcqRel) {
-        return;
-    }
-
-    critical_section::with(|cs| unsafe {
+/// Reset and (re)configure TMR0 for a free-running 1 kHz compare interrupt, and reset
+/// [`TmrDriver::last_boundary`] to match. Shared by [`init`] (first bring-up) and
+/// [`resync_after_sleep`] (TMR0 does not survive `Doze`/`Hibernate` - only the dedicated sleep
+/// timer does - so its registers need reconfiguring from scratch on every wake, the same as at
+/// boot). Must run inside a `critical_section` (both callers already are one).
+fn configure_tmr0(cs: critical_section::CriticalSection) {
+    unsafe {
         // Reset the timer first.
         write16(TMR_REGOFF_ENBL, 0);
         write16(TMR_REGOFF_SCTRL, 0);
@@ -157,7 +167,20 @@ pub fn init() {
         // bit; matching that here mattered on real hardware (bit 0 alone left the counter
         // not running).
         write16(TMR_REGOFF_ENBL, 0x0f);
-    });
+    }
+}
+
+/// Initialize the time driver (idempotent).
+///
+/// This configures TMR0 for a 1 kHz compare interrupt and enables the TMR interrupt in the ITC.
+/// It must be called once, with interrupts in a known state, before using `embassy-time`.
+/// [`crate::init`] does this.
+pub fn init() {
+    if DRIVER.started.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    critical_section::with(configure_tmr0);
 
     // Enable the TMR interrupt in the ITC - deliberately *outside* the critical section above:
     // this crate's `critical_section` impl (`mc1322x_hal::critical_section_impl`) saves
@@ -166,6 +189,38 @@ pub fn init() {
     unsafe {
         core::ptr::write_volatile((INTBASE + INTENNUM_OFF) as *mut u32, INT_NUM_TMR);
     }
+}
+
+/// Ticks until the earliest scheduled wake, if any is currently pending.
+///
+/// Backs a sleep-aware executor's (`mc1322x_embassy::SleepyExecutor`) decision of whether, and
+/// for how long, it's safe to enter CRM sleep - see [`TmrDriver::next_alarm`]'s doc comment for
+/// how this stays fresh (recomputed every tick, tightened immediately on every new
+/// `schedule_wake`).
+pub(crate) fn ticks_until_next_wake() -> Option<u64> {
+    let next_alarm = critical_section::with(|cs| DRIVER.next_alarm.borrow(cs).get());
+    if next_alarm == u64::MAX {
+        return None;
+    }
+    Some(next_alarm.saturating_sub(DRIVER.now()))
+}
+
+/// Reconcile the time driver's tick count after CRM sleep, and reconfigure TMR0 from scratch.
+///
+/// Doze/Hibernate power down everything except the dedicated sleep timer (RM §5.2.3/§5.3) -
+/// TMR0 itself does not survive, so its registers are meaningless on wake and its counter does
+/// not reflect elapsed time. `elapsed_ticks` (in the same 1 kHz units as [`Driver::now`]) must
+/// therefore come from the sleep duration the caller itself chose and armed as the CRM wake-up
+/// timeout, not be re-derived from TMR0's post-wake state. Call this immediately after
+/// `mc1322x_hal::sleep::sleep(..)` returns `WakeReason::Timer`, before anything else reads the
+/// time - `base` is advanced and TMR0 reconfigured in one critical section so no `now()`/
+/// `schedule_wake()` caller can observe a "time went backwards" or "no time passed" window.
+pub(crate) fn resync_after_sleep(elapsed_ticks: u64) {
+    critical_section::with(|cs| {
+        let base = DRIVER.base.borrow(cs);
+        base.set(base.get().wrapping_add(elapsed_ticks));
+        configure_tmr0(cs);
+    });
 }
 
 /// TMR0 interrupt handler, called by the ROM's interrupt dispatcher.
@@ -202,10 +257,12 @@ impl TmrDriver {
             // Re-arm the compare for the next period.
             unsafe { write16(TMR_REGOFF_COMP1, cntr.wrapping_add(PERIOD as u16)) };
 
-            // Wake every timer that has expired.
+            // Wake every timer that has expired, and cache the (possibly now-updated) next
+            // deadline for `ticks_until_next_wake`.
             let now = self.base.borrow(cs).get();
             let mut queue = self.queue.borrow(cs).borrow_mut();
-            queue.next_expiration(now);
+            let next_alarm = queue.next_expiration(now);
+            self.next_alarm.borrow(cs).set(next_alarm);
         });
     }
 }

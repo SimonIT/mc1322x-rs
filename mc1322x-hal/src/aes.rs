@@ -16,9 +16,13 @@
 //! `CTR` word registers (word 0 = least-significant 32 bits, each word big-endian) is verified
 //! against the FIPS-197 Appendix B / C.1 known-answer test in `examples/aes-selftest`.
 
+use core::task::Poll;
+
 use embedded_cal::{AadGenerator, AeadAlgorithm, AeadProvider, DecryptionFailed, build_b0};
+use mc1322x_sys::INTBASE;
 
 use crate::power::power_up_regulators;
+use crate::util::WakerCell;
 
 const BASE: usize = 0x8000_8000;
 
@@ -43,11 +47,37 @@ const CONTROL1_MASK_IRQ: u32 = 1 << 31;
 const STATUS_DONE: u32 = 1 << 24;
 const STATUS_TEST_PASS: u32 = 1 << 25;
 
-/// `CONTROL1` bits that stay set across every operation once the module is
-/// brought up: powered on, running in `NORMAL_MODE` (as opposed to the boot
-/// mode that decrypts from an internal secret key), interrupt masked because
-/// this driver polls `STATUS.DONE` instead of servicing the IRQ.
+/// `CONTROL1` bits that stay set across every blocking operation: powered on, running in
+/// `NORMAL_MODE` (as opposed to the boot mode that decrypts from an internal secret key),
+/// interrupt masked because the blocking path polls `STATUS.DONE` instead of servicing the
+/// IRQ. This is also the *resting* state between operations, including after an async one
+/// completes — see [`Aes::poll_done_status`].
 const CONTROL1_IDLE: u32 = CONTROL1_ON | CONTROL1_NORMAL_MODE | CONTROL1_MASK_IRQ;
+
+/// Same as [`CONTROL1_IDLE`] but with the IRQ left unmasked, for the `_async` operations:
+/// unlike the blocking path, they wait for [`asm_isr`] rather than polling `STATUS.DONE`, so
+/// the module must actually be allowed to raise the interrupt.
+const CONTROL1_IDLE_ASYNC: u32 = CONTROL1_IDLE & !CONTROL1_MASK_IRQ;
+
+// ITC (interrupt controller) offset/number for the ASM (AES) completion interrupt (see
+// `isr.h`'s `INTENNUM_OFF` and `interrupt_nums`), following the same wiring as
+// `crate::i2c`'s `INT_NUM_I2C`. Unlike SPI (RM §15.5.5: "no local mask bit"), ASM has its own
+// local IRQ mask (`CONTROL1_MASK_IRQ` above), so — like I2C — the ITC channel itself is armed
+// once, permanently, in [`Aes::new`]; the local mask bit is what actually gates whether an
+// operation's completion raises the interrupt. `irq()` (linked from `libmc1322x`) already
+// dispatches `INT_NUM_ASM` to the weak `asm_isr` symbol overridden at the bottom of this file
+// — that dispatch exists upstream already, unlike SPI's dispatch which this project's fork
+// added.
+const INTENNUM_OFF: u32 = 0x8;
+const INT_NUM_ASM: u32 = 0;
+
+/// Waker for the in-flight `_async` operation, if any.
+///
+/// Set (with `CONTROL1_MASK_IRQ` cleared) by [`Aes::start_and_wait_async`] before it returns
+/// `Pending`, and taken and woken by [`asm_isr`] the next time the module raises the
+/// interrupt. A single instance suffices, same as [`crate::spi`]'s: [`Aes`]'s own doc comment
+/// already limits it to one operation in flight at a time.
+static WAKER: WakerCell = WakerCell::new();
 
 unsafe fn write_words(base: *mut u32, words: [u32; 4]) {
     for (i, w) in words.into_iter().enumerate() {
@@ -106,6 +136,11 @@ impl Aes {
             let pass = STATUS.read_volatile() & STATUS_TEST_PASS != 0;
             CONTROL1.write_volatile(CONTROL1_IDLE);
             assert!(pass, "ASM self-test failed");
+
+            // Route the ASM completion interrupt to the core. This only affects the async
+            // path: `CONTROL1_MASK_IRQ` stays set (see `CONTROL1_IDLE` above) until an
+            // `_async` operation clears it, so the blocking API is unaffected.
+            core::ptr::write_volatile((INTBASE + INTENNUM_OFF) as *mut u32, INT_NUM_ASM);
         }
         Aes { _private: () }
     }
@@ -114,22 +149,90 @@ impl Aes {
         unsafe { write_words(KEY0, block_to_words(key)) };
     }
 
-    /// Start the currently-configured operation and block until it completes.
+    /// Check once whether the operation started by [`Self::start_and_wait`]/
+    /// [`Self::start_and_wait_async`] has completed.
+    ///
+    /// Shared by the blocking [`Self::start_and_wait`] (spins on this) and the async
+    /// [`Self::start_and_wait_async`] (checked once up front, then again each time
+    /// [`asm_isr`] wakes the task).
     ///
     /// `DONE` is cleared here (`CONTROL0.CLEAR_IRQ`) right after being observed, rather than
     /// left set: per RM Table 10-1, writing `CLEAR_IRQ` is the *only* documented way to clear
     /// it, and a fresh `START` does not do so implicitly. Without this, every call after the
     /// first would see `DONE` still set from the previous operation and return immediately,
     /// racing ahead of the 13/26-clock operation it just started instead of actually waiting
-    /// for it.
+    /// for it. Also restores `CONTROL1_MASK_IRQ` (a no-op for the blocking path, which never
+    /// clears it in the first place) — the resting default [`Aes`] is left in once an async
+    /// operation's wait is over.
+    fn poll_done_status(&mut self) -> Poll<()> {
+        unsafe {
+            if STATUS.read_volatile() & STATUS_DONE == 0 {
+                return Poll::Pending;
+            }
+            CONTROL0.write_volatile(CONTROL0_CLEAR_IRQ);
+            CONTROL1.write_volatile(CONTROL1.read_volatile() | CONTROL1_MASK_IRQ);
+        }
+        Poll::Ready(())
+    }
+
+    /// Start the currently-configured operation and block until it completes.
     fn start_and_wait(&mut self) {
         unsafe {
             CONTROL0.write_volatile(CONTROL0_START);
-            while STATUS.read_volatile() & STATUS_DONE == 0 {
-                core::hint::spin_loop();
-            }
-            CONTROL0.write_volatile(CONTROL0_CLEAR_IRQ);
         }
+        loop {
+            if let Poll::Ready(()) = self.poll_done_status() {
+                return;
+            }
+            core::hint::spin_loop();
+        }
+    }
+
+    /// Async equivalent of [`Self::start_and_wait`].
+    ///
+    /// Waits for [`asm_isr`] to wake this task rather than polling `STATUS.DONE` in a loop.
+    /// Callers must configure `CONTROL1` with [`CONTROL1_IDLE_ASYNC`] (IRQ unmasked) rather
+    /// than [`CONTROL1_IDLE`] before calling this — see [`Self::ctr_block_async`]/
+    /// [`Self::cbc_mac_block_async`] — since a masked module never raises the interrupt this
+    /// waits on. The check-then-arm sequence runs inside a single [`critical_section::with`]
+    /// call so a completion landing between the check and enabling the interrupt can't be
+    /// missed, same as [`crate::i2c::I2c0::wait_byte_async`].
+    ///
+    /// Unlike I2C/SPI, [`Self::poll_done_status`] is only consulted for the *first* poll here,
+    /// not on every re-poll: per RM Table 10-1, `CLEAR_IRQ` is the only way to silence a
+    /// pending completion at all (there's no separate local enable bit that gates a *new*
+    /// interrupt without also being able to clear an *already-latched* one — confirmed on
+    /// hardware: masking `CONTROL1_MASK_IRQ` alone left `irq()`'s dispatch loop re-entering
+    /// [`asm_isr`] forever), so [`asm_isr`] itself must clear `DONE` to return at all. That
+    /// means `STATUS.DONE` already reads clear by the time a re-poll happens, and re-checking
+    /// it here would misread "already handled by the ISR" as "still pending" and hang forever.
+    /// Once armed, [`WAKER`] is the only thing that ever wakes this specific future, and only
+    /// [`asm_isr`] ever wakes it — so a second poll is itself the completion signal.
+    ///
+    /// Holds a [`crate::sleep::SleepInhibitGuard`] for as long as the operation is in flight -
+    /// see that type's doc comment for why a sleep-aware executor must not sleep while this
+    /// module's completion interrupt is what a task is waiting on.
+    async fn start_and_wait_async(&mut self) {
+        unsafe {
+            CONTROL0.write_volatile(CONTROL0_START);
+        }
+        let mut armed = false;
+        let mut inhibit = None;
+        core::future::poll_fn(|cx| {
+            critical_section::with(|cs| {
+                if armed {
+                    return Poll::Ready(());
+                }
+                if let Poll::Ready(()) = self.poll_done_status() {
+                    return Poll::Ready(());
+                }
+                inhibit.get_or_insert_with(crate::sleep::SleepInhibitGuard::new);
+                WAKER.set(cs, cx.waker());
+                armed = true;
+                Poll::Pending
+            })
+        })
+        .await
     }
 
     /// Raw AES-128 ECB single-block encryption, `AES(key, block)`.
@@ -141,6 +244,12 @@ impl Aes {
     pub fn ecb_encrypt_block(&mut self, key: [u8; 16], block: [u8; 16]) -> [u8; 16] {
         self.load_key(key);
         self.ctr_block(block, [0u8; 16])
+    }
+
+    /// Async equivalent of [`Self::ecb_encrypt_block`].
+    pub async fn ecb_encrypt_block_async(&mut self, key: [u8; 16], block: [u8; 16]) -> [u8; 16] {
+        self.load_key(key);
+        self.ctr_block_async(block, [0u8; 16]).await
     }
 
     /// One AES-CTR block: returns `data XOR AES(key, counter)`, i.e.
@@ -173,6 +282,29 @@ impl Aes {
     fn cbc_mac_result(&self) -> [u8; 16] {
         words_to_block(unsafe { read_words(CBC0_RESULT) })
     }
+
+    /// Async equivalent of [`Self::ctr_block`].
+    async fn ctr_block_async(&mut self, counter: [u8; 16], data: [u8; 16]) -> [u8; 16] {
+        unsafe {
+            CONTROL1.write_volatile(CONTROL1_IDLE_ASYNC | CONTROL1_CTR);
+            write_words(DATA0, block_to_words(data));
+            write_words(CTR0, block_to_words(counter));
+        }
+        self.start_and_wait_async().await;
+        words_to_block(unsafe { read_words(CTR0_RESULT) })
+    }
+
+    /// Async equivalent of [`Self::cbc_mac_block`].
+    async fn cbc_mac_block_async(&mut self, block: [u8; 16], first: bool) {
+        unsafe {
+            CONTROL1.write_volatile(CONTROL1_IDLE_ASYNC | CONTROL1_CBC);
+            write_words(DATA0, block_to_words(block));
+            if first {
+                CONTROL0.write_volatile(CONTROL0_CLEAR);
+            }
+        }
+        self.start_and_wait_async().await;
+    }
 }
 
 impl Default for Aes {
@@ -193,6 +325,21 @@ fn feed_padded(asm: &mut Aes, buf: &mut [u8; 16], filled: &mut usize, mut bytes:
         bytes = &bytes[take..];
         if *filled == 16 {
             asm.cbc_mac_block(*buf, false);
+            *buf = [0u8; 16];
+            *filled = 0;
+        }
+    }
+}
+
+/// Async equivalent of [`feed_padded`].
+async fn feed_padded_async(asm: &mut Aes, buf: &mut [u8; 16], filled: &mut usize, mut bytes: &[u8]) {
+    while !bytes.is_empty() {
+        let take = (16 - *filled).min(bytes.len());
+        buf[*filled..*filled + take].copy_from_slice(&bytes[..take]);
+        *filled += take;
+        bytes = &bytes[take..];
+        if *filled == 16 {
+            asm.cbc_mac_block_async(*buf, false).await;
             *buf = [0u8; 16];
             *filled = 0;
         }
@@ -275,6 +422,160 @@ impl Aes {
             chunk.copy_from_slice(&out[..chunk.len()]);
         }
     }
+
+    /// Async equivalent of [`Self::ccm_mac`].
+    async fn ccm_mac_async(
+        &mut self,
+        nonce: &[u8; 13],
+        aad: &impl AadGenerator,
+        message: &[u8],
+    ) -> [u8; 16] {
+        let a_len: usize = aad.items().map(<[u8]>::len).sum();
+        debug_assert!(a_len < 0xff00, "AAD too long for the 2-byte length prefix");
+
+        let b0 = build_b0(nonce, message.len(), a_len, 8);
+        self.cbc_mac_block_async(b0, true).await;
+
+        if a_len > 0 {
+            let mut buf = [0u8; 16];
+            let mut filled = 0;
+            feed_padded_async(self, &mut buf, &mut filled, &(a_len as u16).to_be_bytes()).await;
+            for chunk in aad.items() {
+                feed_padded_async(self, &mut buf, &mut filled, chunk).await;
+            }
+            if filled > 0 {
+                self.cbc_mac_block_async(buf, false).await;
+            }
+        }
+
+        for chunk in message.chunks(16) {
+            let mut block = [0u8; 16];
+            block[..chunk.len()].copy_from_slice(chunk);
+            self.cbc_mac_block_async(block, false).await;
+        }
+
+        self.cbc_mac_result()
+    }
+
+    /// Async equivalent of [`Self::ccm_ctr_crypt`].
+    async fn ccm_ctr_crypt_async(&mut self, nonce: &[u8; 13], message: &mut [u8]) {
+        for (i, chunk) in message.chunks_mut(16).enumerate() {
+            let a = build_a(nonce, (i + 1) as u16);
+            let mut block = [0u8; 16];
+            block[..chunk.len()].copy_from_slice(chunk);
+            let out = self.ctr_block_async(a, block).await;
+            chunk.copy_from_slice(&out[..chunk.len()]);
+        }
+    }
+
+    /// Async equivalent of [`AeadProvider::encrypt_in_place`].
+    ///
+    /// There is no async counterpart of [`AeadProvider`] in `embedded_cal` to implement
+    /// against, so this is an inherent method mirroring the trait's shape instead.
+    pub async fn encrypt_in_place_async(
+        &mut self,
+        key: &[u8; 16],
+        nonce: &[u8],
+        message: &mut [u8],
+        aad: impl AadGenerator,
+    ) -> [u8; 8] {
+        let nonce: [u8; 13] = nonce
+            .try_into()
+            .expect("AES-CCM-16-64-128 uses a 13-byte nonce");
+
+        self.load_key(*key);
+        let mac = self.ccm_mac_async(&nonce, &aad, message).await;
+        let s0 = self.ctr_block_async(build_a(&nonce, 0), [0u8; 16]).await;
+        self.ccm_ctr_crypt_async(&nonce, message).await;
+
+        let mut tag = [0u8; 8];
+        for i in 0..8 {
+            tag[i] = mac[i] ^ s0[i];
+        }
+        tag
+    }
+
+    /// Async equivalent of [`AeadProvider::decrypt_in_place`].
+    ///
+    /// There is no async counterpart of [`AeadProvider`] in `embedded_cal` to implement
+    /// against, so this is an inherent method mirroring the trait's shape instead.
+    pub async fn decrypt_in_place_async(
+        &mut self,
+        key: &[u8; 16],
+        nonce: &[u8],
+        message: &mut [u8],
+        tag: &[u8],
+        aad: impl AadGenerator,
+    ) -> Result<(), DecryptionFailed> {
+        let nonce: [u8; 13] = nonce
+            .try_into()
+            .expect("AES-CCM-16-64-128 uses a 13-byte nonce");
+        assert_eq!(tag.len(), 8, "AES-CCM-16-64-128 uses an 8-byte tag");
+
+        self.load_key(*key);
+        self.ccm_ctr_crypt_async(&nonce, message).await;
+        let mac = self.ccm_mac_async(&nonce, &aad, message).await;
+        let s0 = self.ctr_block_async(build_a(&nonce, 0), [0u8; 16]).await;
+
+        let mut expected = [0u8; 8];
+        for i in 0..8 {
+            expected[i] = mac[i] ^ s0[i];
+        }
+
+        // Not constant-time: fine for a sketch, same caveat as `AeadProvider::decrypt_in_place`.
+        if expected != *tag {
+            message.fill(0);
+            return Err(DecryptionFailed);
+        }
+        Ok(())
+    }
+}
+
+/// ASM (AES) completion interrupt handler.
+///
+/// Overrides the weak `asm_isr` symbol declared in `libmc1322x`'s `isr.h`; the linked `irq()`
+/// handler (`mc1322x-sys/libmc1322x/src/isr.c`) dispatches here whenever `INT_NUM_ASM` is
+/// pending, i.e. whenever `CONTROL1_MASK_IRQ` is clear and `STATUS_DONE` is set. Unlike SPI's
+/// dispatch, this one already exists upstream in `libmc1322x` — see the comment above
+/// `INT_NUM_ASM`.
+///
+/// Unlike I2C/SPI's ISRs, this one *does* clear the completion condition itself
+/// (`CONTROL0.CLEAR_IRQ`) rather than leaving that to task context — matching `tests/asm.c`'s
+/// own reference `asm_isr`. Hardware-verified to be necessary, the hard way: `CONTROL1_MASK_IRQ`
+/// only gates *new* interrupts, it doesn't retract one already latched, so masking it here
+/// (I2C/SPI's style local-disable, tried first) left `STATUS.DONE` asserted and `irq()`'s
+/// `while (pending)` dispatch loop re-entered this handler forever — a real hardware livelock,
+/// caught via a JTAG-readable boot checkpoint that never advanced past [`Aes::new`] arming the
+/// ITC channel. `CLEAR_IRQ` is, per RM Table 10-1, the *only* documented way to actually
+/// silence it. See [`Aes::start_and_wait_async`] for why clearing it here (instead of in task
+/// context, like I2C/SPI) is safe: a second poll after arming is itself sufficient proof of
+/// completion, without needing to re-observe `STATUS.DONE`.
+///
+/// See [`crate::util::WakerCell::wake`] for why waking a waker left behind by a cancelled
+/// (dropped) async operation is harmless.
+///
+/// This handler is *unconditionally* linked into any binary that depends on `mc1322x-hal`,
+/// whether or not it ever constructs an [`Aes`] — same reasoning as [`crate::i2c::i2c_isr`]'s
+/// doc comment.
+///
+/// # Caveats
+///
+/// Hardware-verified end-to-end (`examples/aes-selftest`'s async phase, both via UART report
+/// and JTAG-readable checkpoints): the FIPS-197 known-answer vector round-trips correctly
+/// through the async path. The specific "genuinely suspend and get woken by a real pending
+/// interrupt" branch inside [`Aes::start_and_wait_async`] was not directly isolated by that
+/// test, though — a single AES block operation (13-26 peripheral clocks) is fast enough that
+/// the first, pre-arm poll already tends to observe `STATUS.DONE` before ever arming the wait,
+/// same as the fix for the self-test livelock above was itself found *because* arming did
+/// matter for a stale, already-latched condition. The code path is exercised for real (the
+/// livelock above only reproduced once the ITC channel was actually armed), just not
+/// distinguished from the fast-path in the test's observable pass/fail outcome.
+#[unsafe(no_mangle)]
+extern "C" fn asm_isr() {
+    unsafe {
+        CONTROL0.write_volatile(CONTROL0_CLEAR_IRQ);
+    }
+    WAKER.wake();
 }
 
 impl AeadProvider for Aes {

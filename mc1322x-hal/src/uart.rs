@@ -229,11 +229,13 @@ impl Uart {
     /// `USTAT_RXRDY` is already set by the time `UCON_MRXR` is cleared, the pending interrupt
     /// fires as soon as the critical section ends.
     async fn wait_rx_ready(&mut self) {
+        let mut inhibit = None;
         core::future::poll_fn(|cx| {
             critical_section::with(|cs| {
                 if self.rx_count() > 0 {
                     return Poll::Ready(());
                 }
+                inhibit.get_or_insert_with(crate::sleep::SleepInhibitGuard::new);
                 self.wakers().rx.set(cs, cx.waker());
                 unsafe {
                     self.write_reg(UCON, self.read_reg(UCON) & !Ucon::MRXR.bits());
@@ -245,12 +247,19 @@ impl Uart {
     }
 
     /// Async equivalent of [`Self::wait_rx_ready`] for the TX FIFO having a free slot.
+    ///
+    /// Both this and [`Self::wait_rx_ready`] hold a [`crate::sleep::SleepInhibitGuard`] for as
+    /// long as the wait is in flight - see that type's doc comment for why a sleep-aware
+    /// executor must not sleep while this module's completion interrupt is what a task is
+    /// waiting on.
     async fn wait_tx_ready(&mut self) {
+        let mut inhibit = None;
         core::future::poll_fn(|cx| {
             critical_section::with(|cs| {
                 if self.tx_free() > 0 {
                     return Poll::Ready(());
                 }
+                inhibit.get_or_insert_with(crate::sleep::SleepInhibitGuard::new);
                 self.wakers().tx.set(cs, cx.waker());
                 unsafe {
                     self.write_reg(UCON, self.read_reg(UCON) & !Ucon::MTXR.bits());

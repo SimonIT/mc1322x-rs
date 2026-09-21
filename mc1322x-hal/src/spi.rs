@@ -158,22 +158,45 @@ impl Spi {
     /// Async equivalent of [`Self::transfer_word`].
     ///
     /// Arms the ITC's SPI channel (`INT_NUM_SPI`) and waits for [`spi_isr`] to wake this task,
-    /// rather than polling. The check-then-arm sequence runs inside a single
-    /// [`critical_section::with`] call so a completion landing between the check and enabling
-    /// the interrupt can't be missed: interrupts stay masked for the whole sequence, so if
-    /// `SPI_INT` is already set by the time `INT_NUM_SPI` is written to `INTENNUM`, the
-    /// pending interrupt fires as soon as the critical section ends.
+    /// rather than polling.
+    ///
+    /// The `INTENNUM` write deliberately runs *outside* the `critical_section::with` block
+    /// below, unlike the completion check and [`WAKER`] arm — hardware-confirmed necessary:
+    /// `mc1322x-hal`'s `critical_section::Impl` (see `crate::critical_section_impl`) saves the
+    /// ITC's single, shared `INTENABLE` register on entry and unconditionally restores that
+    /// saved value on exit. `INTENNUM` is a bit-*set* into that same `INTENABLE` register (RM
+    /// §15.5.5: SPI has no local mask bit, so the ITC channel itself is the only enable/disable
+    /// mechanism), so arming it *inside* a critical section built on that impl gets silently
+    /// undone the instant the section ends — the same bug this project's own notes already
+    /// document for `mc1322x-embassy`'s TMR0 setup, just never previously checked here, since
+    /// this path had never been exercised on real hardware before now (confirmed by reproducing
+    /// the hang first: `spi_isr` genuinely never fired with the old, all-inside-one-`with`
+    /// version). Rearming on every poll (including the one that immediately follows being
+    /// woken) is harmless — `INTENNUM` is a plain "ensure this bit is set" write, not something
+    /// that can double-arm or lose an already-pending completion.
+    ///
+    /// The completion check and [`WAKER`] arm still run inside one [`critical_section::with`]
+    /// call so a completion landing between them can't be missed — interrupts stay masked for
+    /// that inner sequence regardless of `INTENNUM`'s state, so if `SPI_INT` is already set by
+    /// the time the section is entered, `poll_transfer_status` observes it directly rather than
+    /// needing the interrupt to fire at all.
+    ///
+    /// Holds a [`crate::sleep::SleepInhibitGuard`] for as long as the transfer is in flight -
+    /// see that type's doc comment for why a sleep-aware executor must not sleep while this
+    /// module's completion interrupt is what a task is waiting on.
     async fn transfer_word_async(&mut self, tx: u8) -> u8 {
         self.start_transfer(tx);
+        let mut inhibit = None;
         core::future::poll_fn(|cx| {
+            unsafe {
+                core::ptr::write_volatile((INTBASE + INTENNUM_OFF) as *mut u32, INT_NUM_SPI);
+            }
             critical_section::with(|cs| {
                 if let Poll::Ready(rx) = self.poll_transfer_status() {
                     return Poll::Ready(rx);
                 }
+                inhibit.get_or_insert_with(crate::sleep::SleepInhibitGuard::new);
                 WAKER.set(cs, cx.waker());
-                unsafe {
-                    core::ptr::write_volatile((INTBASE + INTENNUM_OFF) as *mut u32, INT_NUM_SPI);
-                }
                 Poll::Pending
             })
         })

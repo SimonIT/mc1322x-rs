@@ -19,6 +19,12 @@
 //! `mc1322x-hal`'s `critical_section` implementation instead (see `vendor/README.md` for what and
 //! why).
 //!
+//! For applications that want the CPU to actually enter CRM `Doze` between polls instead of
+//! busy-polling, [`sleepy_executor::SleepyExecutor`] is an opt-in alternative to the plain
+//! `embassy_executor::Executor` above — see its module docs for what it is and isn't safe for
+//! (only pure-timer-plus-`mc1322x-hal`-async-peripheral workloads) and why it can't be combined
+//! with `platform-spin` in the same binary.
+//!
 //! # Usage
 //!
 //! ```ignore
@@ -53,6 +59,7 @@
 // not for any item this crate's own code calls.
 use mc1322x_hal as _;
 
+pub mod sleepy_executor;
 pub mod time_driver;
 
 /// Bring up the chip-specific Embassy platform pieces.

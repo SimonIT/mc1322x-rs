@@ -27,6 +27,7 @@
 //! a couple of harmless throwaway sleep/wake cycles first.
 
 use mc1322x_sys::CRM_BASE;
+use portable_atomic::{AtomicU32, Ordering};
 
 const WU_CNTL: *mut u32 = (CRM_BASE as usize + 0x04) as *mut u32;
 const SLEEP_CNTL: *mut u32 = (CRM_BASE as usize + 0x08) as *mut u32;
@@ -171,6 +172,42 @@ unsafe fn read_reg(reg: *mut u32) -> u32 {
 #[inline]
 unsafe fn write_reg(reg: *mut u32, value: u32) {
     unsafe { reg.write_volatile(value) }
+}
+
+static SLEEP_INHIBIT_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// RAII guard that inhibits a sleep-aware executor (`mc1322x_embassy::SleepyExecutor`) from
+/// entering CRM sleep for as long as it's held.
+///
+/// Every async peripheral wait in this crate (`uart`, `spi`, `i2c`, `delay`, `aes`, `adc`,
+/// `gpio`'s `KbiInput`) holds one for the duration of its pending wait. All of those
+/// peripherals lose their clock during [`sleep`] (`Doze`/`Hibernate` power down everything
+/// except the sleep timer) and can never raise the completion interrupt the wait depends on, so
+/// entering sleep while one is in flight would hang that task forever — a sleep-aware executor
+/// must check [`SleepInhibitGuard::count`] before sleeping and refuse to when it's nonzero.
+/// Constructible only from within this crate: only its own drivers should ever hold one, since
+/// this is exactly the set of things that actually inhibit sleep on this hardware.
+pub struct SleepInhibitGuard {
+    _private: (),
+}
+
+impl SleepInhibitGuard {
+    pub(crate) fn new() -> Self {
+        SLEEP_INHIBIT_COUNT.fetch_add(1, Ordering::AcqRel);
+        SleepInhibitGuard { _private: () }
+    }
+
+    /// Current inhibit count. Nonzero means at least one async peripheral wait in this crate is
+    /// currently in flight.
+    pub fn count() -> u32 {
+        SLEEP_INHIBIT_COUNT.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for SleepInhibitGuard {
+    fn drop(&mut self) {
+        SLEEP_INHIBIT_COUNT.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// Enter `mode` until one of `sources` wakes the chip, then return why.

@@ -114,10 +114,47 @@ impl I2c0 {
     }
 
     /// Generate a STOP condition.
+    ///
+    /// Hardware-confirmed necessary to do more than the obvious `I2CCR &= !MSTA`: on real
+    /// hardware, `I2C_SR.MBB` (bus busy) was found to stay stuck set after *any* aborted
+    /// transfer (`NoAcknowledge` or `ArbitrationLost`) with only that plain clear — permanently
+    /// hanging the next transaction's own bus-idle wait forever, sync (tight spin) or async
+    /// (yield loop) alike, since per RM §14.8.4 `MBB` only clears "if a STOP condition is
+    /// detected" and a plain `MSTA` clear evidently doesn't reliably produce one from this
+    /// state on this chip.
+    ///
+    /// The fix ported here is `libmc1322x/lib/i2c.c`'s own `i2c_force_reset()` ("force SCL to
+    /// become bus master when sda is still low") - a documented reference recovery sequence
+    /// that was written but never actually wired into any transaction path, upstream or in this
+    /// port, and so had never been exercised until this bug surfaced: toggle `I2C_MEN` off then
+    /// back on with `MSTA` already set, plus a dummy `I2CDR` read, which reliably clears the
+    /// stuck `MBB`. On its own this left the module unable to complete any *subsequent*
+    /// transaction (sync or async), which the reference function's minimal three-write sequence
+    /// doesn't address; settling `I2CCR` back to a plain `MEN`-only resting state afterward
+    /// (rather than whatever bits happened to be set beforehand) fixed that too - hardware
+    /// round-tripped through two full transactions in a row, both sync and async, only after
+    /// adding this settle step.
     fn stop(&mut self) {
+        // Hardware-confirmed necessary: with these four steps run back-to-back at full CPU
+        // speed, the recovery silently doesn't take (the very next transaction still hangs on
+        // `MBB` again) - it only worked reliably in testing when there happened to be real
+        // delay between each step (UART prints, in the diagnostic session that found this
+        // sequence). A few hundred cycles' settling time between each register write
+        // empirically fixed it; not derived from any documented timing spec, since the RM
+        // doesn't cover this recovery sequence at all (see this method's doc comment above).
+        fn settle() {
+            for _ in 0..500u32 {
+                core::hint::black_box(0);
+            }
+        }
         unsafe {
-            let cr = read_u8(I2C_CR);
-            write_u8(I2C_CR, cr & !(I2C_MSTA as u8));
+            write_u8(I2C_CR, I2C_MSTA as u8);
+            settle();
+            write_u8(I2C_CR, I2C_MEN as u8 | I2C_MSTA as u8);
+            settle();
+            let _ = read_u8(I2C_DR);
+            settle();
+            write_u8(I2C_CR, I2C_MEN as u8);
         }
     }
 
@@ -159,12 +196,18 @@ impl I2c0 {
     /// enabling the interrupt can't be missed: interrupts stay masked for the whole
     /// sequence, so if the hardware flag is already set by the time `I2C_MIEN` is written,
     /// the pending interrupt fires as soon as the critical section ends.
+    ///
+    /// Holds a [`crate::sleep::SleepInhibitGuard`] for as long as the wait is in flight - see
+    /// that type's doc comment for why a sleep-aware executor must not sleep while this
+    /// module's completion interrupt is what a task is waiting on.
     async fn wait_byte_async(&mut self) -> Result<(), Error> {
+        let mut inhibit = None;
         core::future::poll_fn(|cx| {
             critical_section::with(|cs| {
                 if let Poll::Ready(result) = self.poll_byte_status() {
                     return Poll::Ready(result);
                 }
+                inhibit.get_or_insert_with(crate::sleep::SleepInhibitGuard::new);
                 WAKER.set(cs, cx.waker());
                 unsafe {
                     write_u8(I2C_CR, read_u8(I2C_CR) | I2C_MIEN as u8);

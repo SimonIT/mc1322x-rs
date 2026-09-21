@@ -1,3 +1,9 @@
 [workspace]
-members = ["mc1322x-sys", "mc1322x-hal", "mc1322x-embassy"]
+members = [
+  "mc1322x-sys",
+  "mc1322x-hal",
+  "mc1322x-embassy",
+  "mc1322x-radio",
+  "mc1322x-ssl",
+]
 resolver = "2"
