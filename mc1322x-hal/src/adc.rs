@@ -117,7 +117,9 @@ impl Adc {
             let control = (CONTROL as *const u16).read_volatile();
             CONTROL.write_volatile(
                 (control
-                    & !(CONTROL_SEQ2_IRQ_ENABLE | CONTROL_SEQ1_IRQ_ENABLE | CONTROL_COMPARE_IRQ_ENABLE))
+                    & !(CONTROL_SEQ2_IRQ_ENABLE
+                        | CONTROL_SEQ1_IRQ_ENABLE
+                        | CONTROL_COMPARE_IRQ_ENABLE))
                     | CONTROL_FIFO_IRQ_ENABLE,
             );
             FIFO_CONTROL.write_volatile(FIFO_LEVEL_MIN);

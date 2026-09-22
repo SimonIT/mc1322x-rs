@@ -18,7 +18,8 @@
 
 use core::task::Poll;
 
-use embedded_cal::{AadGenerator, AeadAlgorithm, AeadProvider, DecryptionFailed, build_b0};
+use embedded_cal::util::aesccm::build_b0;
+use embedded_cal::{AadGenerator, AeadAlgorithm, AeadProvider, DecryptionFailed};
 use mc1322x_sys::INTBASE;
 
 use crate::power::power_up_regulators;
@@ -332,7 +333,12 @@ fn feed_padded(asm: &mut Aes, buf: &mut [u8; 16], filled: &mut usize, mut bytes:
 }
 
 /// Async equivalent of [`feed_padded`].
-async fn feed_padded_async(asm: &mut Aes, buf: &mut [u8; 16], filled: &mut usize, mut bytes: &[u8]) {
+async fn feed_padded_async(
+    asm: &mut Aes,
+    buf: &mut [u8; 16],
+    filled: &mut usize,
+    mut bytes: &[u8],
+) {
     while !bytes.is_empty() {
         let take = (16 - *filled).min(bytes.len());
         buf[*filled..*filled + take].copy_from_slice(&bytes[..take]);

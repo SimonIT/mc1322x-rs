@@ -51,7 +51,9 @@ use core::ptr;
 
 use embassy_executor::pender::Pender;
 use embassy_executor::{Spawner, pender_impl, raw};
-use mc1322x_hal::sleep::{RamRetention, Retention, SleepInhibitGuard, SleepMode, WakeSources, sleep};
+use mc1322x_hal::sleep::{
+    RamRetention, Retention, SleepInhibitGuard, SleepMode, WakeSources, sleep,
+};
 
 use crate::time_driver;
 

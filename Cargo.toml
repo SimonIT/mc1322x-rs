@@ -1,9 +1,9 @@
 [workspace]
+resolver = "2"
 members = [
-  "mc1322x-sys",
-  "mc1322x-hal",
   "mc1322x-embassy",
+  "mc1322x-hal",
   "mc1322x-radio",
   "mc1322x-ssl",
+  "mc1322x-sys",
 ]
-resolver = "2"
