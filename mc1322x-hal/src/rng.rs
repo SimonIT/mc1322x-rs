@@ -62,24 +62,21 @@ impl Rng {
 
     /// Reseed the LFSR.
     ///
-    /// Hardware-verified guarantee: a `seed(x)` call immediately followed by exactly **one**
-    /// read is 100% deterministic and depends only on `x`, regardless of any prior seed/read
-    /// history (confirmed across several independently-designed test shapes on real hardware -
-    /// 30+ trials, including sweeps over very different prior seeds, with and without an
-    /// intervening read). Non-determinism only appears once more than one register access
-    /// happens between the `seed()` write and the read you care about (a loop, multiple reads,
-    /// other code in between) - most likely because `MACA_RANDOM` is a genuinely free-running
-    /// LFSR on MACA's own internal clock domain (a separate coprocessor block) rather than one
-    /// that pauses for CPU inspection, so a read's value depends on how many of MACA's own
-    /// clocks have elapsed since the write - reproducible for a fixed, tiny instruction gap but
-    /// not for anything with variable timing. Not root-caused at that level (would need
-    /// independent confirmation of MACA's internal clock-domain behavior); there's also no
-    /// reference use of `MACA_RANDOM` as a write anywhere in `libmc1322x` (only reads, e.g.
-    /// `per.c`'s `random_short_addr()`) to check against, and the RM (§9.7.2) gives no timing
-    /// detail beyond "writing to this register initializes the engine with a seed".
+    /// A `seed(x)` call immediately followed by exactly **one** read is deterministic and depends
+    /// only on `x`, regardless of any prior seed/read history. Non-determinism only appears once
+    /// more than one register access happens between the `seed()` write and the read you care about
+    /// (a loop, multiple reads, other code in between) - most likely because `MACA_RANDOM` is a
+    /// genuinely free-running LFSR on MACA's own internal clock domain (a separate coprocessor
+    /// block) rather than one that pauses for CPU inspection, so a read's value depends on how many
+    /// of MACA's own clocks have elapsed since the write - repeatable for a fixed, tiny instruction
+    /// gap but not for anything with variable timing. The RM doesn't document MACA's internal
+    /// clock-domain behavior; there's also no reference use of `MACA_RANDOM` as a write anywhere in
+    /// `libmc1322x` (only reads, e.g. `per.c`'s `random_short_addr()`) to check against, and the RM
+    /// (§9.7.2) gives no timing detail beyond "writing to this register initializes the engine with
+    /// a seed".
     ///
     /// Use [`Self::seed_and_read`] instead of calling this and [`Self::try_next_u32`]
-    /// separately, to get the proven-safe tight pattern without relying on the compiler/call
+    /// separately, to get the deterministic tight pattern without relying on the compiler/call
     /// site not inserting anything in between.
     pub fn seed(&mut self, seed: u32) {
         unsafe { MACA_RANDOM.write_volatile(seed) }
@@ -87,11 +84,11 @@ impl Rng {
 
     /// Reseed the LFSR and read back the immediately-following value in one call.
     ///
-    /// Formalizes the exact write-then-read pattern [`Self::seed`]'s doc comment proves is
+    /// Formalizes the exact write-then-read pattern [`Self::seed`]'s doc comment describes as
     /// deterministic, so callers get that guarantee without needing to worry about anything
-    /// landing between two separate `seed()`/read calls. Hardware-verified to reproduce the
-    /// same value for a given `seed` regardless of what preceded it (fresh MACA bring-up, or
-    /// right after a completely different seed's own read).
+    /// landing between two separate `seed()`/read calls: the same value for a given `seed`
+    /// regardless of what preceded it (fresh MACA bring-up, or right after a completely
+    /// different seed's own read).
     pub fn seed_and_read(&mut self, seed: u32) -> u32 {
         self.seed(seed);
         self.read()

@@ -2,7 +2,7 @@
 name = "mc1322x-radio"
 version = "0.1.0"
 edition = "2024"
-description = "IEEE 802.15.4 radio driver for the MC1322x MACA coprocessor, with optional dot15d4::phy::radio::Radio and ieee802154::mac::Frame integration"
+description = "IEEE 802.15.4 radio driver for the MC1322x MACA coprocessor"
 
 [dependencies]
 byte = { version = "0.2", optional = true }

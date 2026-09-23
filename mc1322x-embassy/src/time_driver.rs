@@ -26,8 +26,7 @@
 //! # Caveats
 //!
 //! The ROM dispatcher must use interworking (`bx`) to call the ISR, because Rust code is compiled
-//! to Thumb while the ROM runs ARM state. This is the same requirement the reference C ISRs have
-//! and must be validated on hardware.
+//! to Thumb while the ROM runs ARM state. This is the same requirement the reference C ISRs have.
 
 use core::cell::{Cell, RefCell};
 use core::sync::atomic::Ordering;
@@ -164,8 +163,7 @@ fn configure_tmr0(cs: critical_section::CriticalSection) {
         // Enable TMR0. `TMR_ENBL` is a single shared register for all four TMR channels
         // ("one enable register to rule them all", per libmc1322x's tmr.h) - the reference
         // `tmr-ints.c` test writes 0xf (all four channels) rather than just this channel's
-        // bit; matching that here mattered on real hardware (bit 0 alone left the counter
-        // not running).
+        // bit; matching that here matters (bit 0 alone leaves the counter not running).
         write16(TMR_REGOFF_ENBL, 0x0f);
     }
 }

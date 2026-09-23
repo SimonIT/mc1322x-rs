@@ -12,9 +12,8 @@
 //! the peripheral directly via volatile MMIO instead, the same way
 //! [`crate::rng`] does for `MACA_RANDOM`.
 //!
-//! The mapping between the 16-byte AES block representation used here and the `KEY`/`DATA`/
-//! `CTR` word registers (word 0 = least-significant 32 bits, each word big-endian) is verified
-//! against the FIPS-197 Appendix B / C.1 known-answer test in `examples/aes-selftest`.
+//! The 16-byte AES blocks used here map onto the `KEY`/`DATA`/`CTR` word registers as word 0 =
+//! least-significant 32 bits, each word big-endian.
 
 use core::task::Poll;
 
@@ -202,9 +201,9 @@ impl Aes {
     /// Unlike I2C/SPI, [`Self::poll_done_status`] is only consulted for the *first* poll here,
     /// not on every re-poll: per RM Table 10-1, `CLEAR_IRQ` is the only way to silence a
     /// pending completion at all (there's no separate local enable bit that gates a *new*
-    /// interrupt without also being able to clear an *already-latched* one — confirmed on
-    /// hardware: masking `CONTROL1_MASK_IRQ` alone left `irq()`'s dispatch loop re-entering
-    /// [`asm_isr`] forever), so [`asm_isr`] itself must clear `DONE` to return at all. That
+    /// interrupt without also being able to clear an *already-latched* one — masking
+    /// `CONTROL1_MASK_IRQ` alone leaves `irq()`'s dispatch loop re-entering [`asm_isr`]
+    /// forever), so [`asm_isr`] itself must clear `DONE` to return at all. That
     /// means `STATUS.DONE` already reads clear by the time a re-poll happens, and re-checking
     /// it here would misread "already handled by the ISR" as "still pending" and hang forever.
     /// Once armed, [`WAKER`] is the only thing that ever wakes this specific future, and only
@@ -546,15 +545,13 @@ impl Aes {
 /// `INT_NUM_ASM`.
 ///
 /// Unlike I2C/SPI's ISRs, this one *does* clear the completion condition itself
-/// (`CONTROL0.CLEAR_IRQ`) rather than leaving that to task context — matching `tests/asm.c`'s
-/// own reference `asm_isr`. Hardware-verified to be necessary, the hard way: `CONTROL1_MASK_IRQ`
-/// only gates *new* interrupts, it doesn't retract one already latched, so masking it here
-/// (I2C/SPI's style local-disable, tried first) left `STATUS.DONE` asserted and `irq()`'s
-/// `while (pending)` dispatch loop re-entered this handler forever — a real hardware livelock,
-/// caught via a JTAG-readable boot checkpoint that never advanced past [`Aes::new`] arming the
-/// ITC channel. `CLEAR_IRQ` is, per RM Table 10-1, the *only* documented way to actually
-/// silence it. See [`Aes::start_and_wait_async`] for why clearing it here (instead of in task
-/// context, like I2C/SPI) is safe: a second poll after arming is itself sufficient proof of
+/// (`CONTROL0.CLEAR_IRQ`) rather than leaving that to task context — matching `tests/asm.c`'s own
+/// reference `asm_isr`. This is necessary: `CONTROL1_MASK_IRQ` only gates *new* interrupts, it
+/// doesn't retract one already latched, so masking it here (I2C/SPI's style local-disable) would
+/// leave `STATUS.DONE` asserted and `irq()`'s `while (pending)` dispatch loop re-entering this
+/// handler forever - a livelock. `CLEAR_IRQ` is, per RM Table 10-1, the *only* documented way to
+/// actually silence it. See [`Aes::start_and_wait_async`] for why clearing it here (instead of in
+/// task context, like I2C/SPI) is safe: a second poll after arming is itself sufficient proof of
 /// completion, without needing to re-observe `STATUS.DONE`.
 ///
 /// See [`crate::util::WakerCell::wake`] for why waking a waker left behind by a cancelled
@@ -566,16 +563,9 @@ impl Aes {
 ///
 /// # Caveats
 ///
-/// Hardware-verified end-to-end (`examples/aes-selftest`'s async phase, both via UART report
-/// and JTAG-readable checkpoints): the FIPS-197 known-answer vector round-trips correctly
-/// through the async path. The specific "genuinely suspend and get woken by a real pending
-/// interrupt" branch inside [`Aes::start_and_wait_async`] was not directly isolated by that
-/// test, though — a single AES block operation (13-26 peripheral clocks) is fast enough that
-/// the first, pre-arm poll already tends to observe `STATUS.DONE` before ever arming the wait,
-/// same as the fix for the self-test livelock above was itself found *because* arming did
-/// matter for a stale, already-latched condition. The code path is exercised for real (the
-/// livelock above only reproduced once the ITC channel was actually armed), just not
-/// distinguished from the fast-path in the test's observable pass/fail outcome.
+/// A single AES block operation (13-26 peripheral clocks) is fast enough that the first,
+/// pre-arm poll inside [`Aes::start_and_wait_async`] usually already observes `STATUS.DONE`,
+/// so the "genuinely suspend and get woken by the interrupt" branch is rarely taken.
 #[unsafe(no_mangle)]
 extern "C" fn asm_isr() {
     unsafe {

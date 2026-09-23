@@ -29,6 +29,10 @@
 //! `Pender` registration that would otherwise conflict with `platform-spin` at link time
 //! whether or not `SleepyExecutor` is ever actually named in that consumer's own code.
 //!
+//! With the `task-watchdog` Cargo feature, [`task_watchdog`] plugs the COP hardware watchdog into
+//! the [`task-watchdog`](https://docs.rs/task-watchdog) crate, so several tasks can each be
+//! required to check in before the hardware watchdog gets fed.
+//!
 //! # Usage
 //!
 //! ```ignore
@@ -65,6 +69,8 @@ use mc1322x_hal as _;
 
 #[cfg(feature = "sleepy-executor")]
 pub mod sleepy_executor;
+#[cfg(feature = "task-watchdog")]
+pub mod task_watchdog;
 pub mod time_driver;
 
 /// Bring up the chip-specific Embassy platform pieces.

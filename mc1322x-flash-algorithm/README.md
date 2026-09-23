@@ -92,14 +92,10 @@ probe-rs verify --chip MC13224V \
 ```
 
 - `--base-address 0x0` targets the logical NVM/flash region and is what actually exercises this
-  flash algorithm (a RAM-linked ELF like `blinky`, at `0x400000`, never touches it at all).
+  flash algorithm (a RAM-linked ELF, at `0x400000`, never touches it at all).
 - **Never pass `--dry-run`**: it substitutes a stub probe that doesn't support the ARM7/JTAG path,
   and fails instantly with an unrelated-looking "the selected probe does not support the 'JTAG'
   interface" error.
-
-**Status**: confirmed working end-to-end on real MC13224V hardware (Redbee Econotag) - a full
-attach → `Init()` → erase → program cycle via `download`, followed by an independent `verify` in a
-fresh JTAG session, both complete cleanly with no error.
 
 ## Technical Details
 
@@ -126,9 +122,8 @@ Before accessing flash, the algorithm initializes the voltage regulators via the
 before calling the ROM's `rom_data_init`, mirroring what libmc1322x's `start.S` does on a normal
 boot - `probe-rs`'s `call_function` only initializes the *current* mode's SP, and `rom_data_init`
 internally bank-switches through the others. It also masks IRQ+FIQ for the rest of `Init()`
-(deliberately not restored). Both together fixed a real SWI-vector-trap crash that used to happen
-partway through `Init()` on real hardware; see `Algorithm::new`'s own doc comment in `main.rs` for
-the full account.
+(deliberately not restored), so a stray interrupt can't vector the core through an unset
+exception slot partway through `Init()`; see the comments in `Algorithm::new` in `main.rs`.
 
 ### Flash Type Detection
 

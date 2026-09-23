@@ -9,7 +9,7 @@
 //! With the `dot15d4` feature, [`Mc1322xRadio`] additionally
 //! implements [`dot15d4::phy::radio::Radio`] as a thin wrapper around those
 //! primitives, which is the hardware glue that makes the dot15d4 CSMA layer
-//! (and its example application layer) run on a real 2.4 GHz radio. The
+//! (and the application layers built on it) run on a real 2.4 GHz radio. The
 //! `ieee802154` feature instead adds [`Mc1322xRadio::send_frame`] and
 //! [`Mc1322xRadio::receive_frame`], which fold an
 //! [`ieee802154::mac::Frame`]'s encoding/decoding directly into the transmit
@@ -467,27 +467,11 @@ impl Mc1322xRadio {
         })
     }
 
-    /// TEMPORARY diagnostic (mc1322x-rs session), currently unused by anything (kept for
-    /// reference/reuse only - wiring it in needs a `dot15d4` cached-registry-source edit that's
-    /// no longer applied, see below): combines [`Mc1322xRadio::prepare_transmit`] and
-    /// [`Mc1322xRadio::transmit`] into one `poll_fn` with a single `.await` point at the call
-    /// site, instead of two consecutive ones - an A/B test for a hardware-only stall that
-    /// reproduces right at that exact two-await boundary in `dot15d4`'s own `futures::transmit`
-    /// wrapper (see the `dot15d4_transmit_await_gap` project memory). Behaviorally identical to
-    /// calling both in sequence; the only difference is there is no `async fn` state-machine
-    /// transition between them anymore.
-    ///
-    /// **Result, hardware-verified, reproduced twice**: did not fix the underlying issue - made
-    /// it manifest *earlier and more severely* instead (`PRODUCER_LOOP_COUNT` stuck at `0`
-    /// instead of `1`, and `IRQ_MIN_SP_SEEN` captured as literally `0` - an alarming, clearly
-    /// corrupted stack pointer - during a real MACA interrupt). This rules out the two-await
-    /// continuation mechanism itself as the root cause: whatever is actually wrong is deeper,
-    /// and this change just shifted memory layout enough to make it manifest differently, same
-    /// as every other layout-perturbing change tried across this investigation (see
-    /// `dot15d4_stack_watermark_findings`). Wiring this back in requires re-adding the matching
-    /// `prepare_and_transmit` default trait method to the cached `dot15d4` crate's
-    /// `phy/radio/mod.rs` and the call-site swap in `phy/radio/futures.rs` - not currently
-    /// applied, since it didn't help.
+    /// Combines [`Mc1322xRadio::prepare_transmit`] and [`Mc1322xRadio::transmit`] into one
+    /// `poll_fn`, with a single `.await` point at the call site instead of two consecutive
+    /// ones. Behaviorally identical to calling both in sequence; the only difference is there
+    /// is no `async fn` state-machine transition between them. Not used by the
+    /// `dot15d4::phy::radio::Radio` implementation, whose trait has no matching method.
     ///
     /// # Safety
     /// Same contract as [`Mc1322xRadio::prepare_transmit`].
@@ -545,34 +529,34 @@ impl Mc1322xRadio {
     }
 }
 
-/// TEMPORARY bisection (see the `dot15d4_loopback_repro`/`dot15d4_addressing_panic` project
-/// memory): lowest IRQ-mode stack pointer ever observed at the top of `maca_rx_callback`/
-/// `maca_tx_callback` - both run nested inside `libmc1322x`'s `irq()` -> `maca_isr()` on the
-/// dedicated 256-byte IRQ-mode stack (`IRQ_STACK_SIZE` in `mc1322x-sys/libmc1322x/mc1322x.lds`).
-/// `0` until the first callback runs. Read back over JTAG; compare against that stack's own
-/// `__stack_start__`/`__irq_stack_top__` linker symbols to see how close to overflow it got.
+/// Debug counter, for inspection with a debugger: lowest IRQ-mode stack pointer ever observed
+/// at the top of `maca_rx_callback`/`maca_tx_callback` - both run nested inside `libmc1322x`'s
+/// `irq()` -> `maca_isr()` on the dedicated 256-byte IRQ-mode stack (`IRQ_STACK_SIZE` in
+/// `mc1322x-sys/libmc1322x/mc1322x.lds`). `u32::MAX` until the first callback runs. Compare
+/// against that stack's own `__stack_start__`/`__irq_stack_top__` linker symbols to see how
+/// close to overflow it got.
 #[unsafe(no_mangle)]
 pub static mut IRQ_MIN_SP_SEEN: u32 = u32::MAX;
 
-/// TEMPORARY bisection: number of times `prepare_transmit`'s `poll_fn` has been polled at all.
+/// Debug counter: number of times `prepare_transmit`'s `poll_fn` has been polled at all.
 #[unsafe(no_mangle)]
 pub static mut PREPARE_TRANSMIT_POLLS: u32 = 0;
-/// TEMPORARY bisection: number of those polls that found `claim_free_packet()` returning `None`
+/// Debug counter: number of those polls that found `claim_free_packet()` returning `None`
 /// (the C packet pool exhausted) and returned `Poll::Pending`.
 #[unsafe(no_mangle)]
 pub static mut PREPARE_TRANSMIT_NO_PACKET: u32 = 0;
-/// TEMPORARY bisection: set to `1` once `prepare_transmit` has successfully claimed a packet and
+/// Debug flag: set to `1` once `prepare_transmit` has successfully claimed a packet and
 /// queued it (i.e. resolved `Poll::Ready`) at least once.
 #[unsafe(no_mangle)]
 pub static mut PREPARE_TRANSMIT_GOT_PACKET: u32 = 0;
-/// TEMPORARY bisection: number of times `transmit`'s `poll_fn` has been polled at all.
+/// Debug counter: number of times `transmit`'s `poll_fn` has been polled at all.
 #[unsafe(no_mangle)]
 pub static mut TRANSMIT_POLLS: u32 = 0;
-/// TEMPORARY bisection: `1 + ` the last real MACA status code `transmit()` ever saw via
+/// Debug value: `1 + ` the last real MACA status code `transmit()` ever saw via
 /// `tx_status` (so `0` unambiguously means "never saw one").
 #[unsafe(no_mangle)]
 pub static mut TRANSMIT_STATUS_SEEN: u32 = 0;
-/// TEMPORARY bisection: set to `1` if `transmit()` ever resolved via the `cancelled` branch
+/// Debug flag: set to `1` if `transmit()` ever resolved via the `cancelled` branch
 /// instead of a real status.
 #[unsafe(no_mangle)]
 pub static mut TRANSMIT_CANCELLED_SEEN: u32 = 0;

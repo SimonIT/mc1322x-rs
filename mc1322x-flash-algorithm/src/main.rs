@@ -166,11 +166,9 @@ impl FlashAlgorithm for Algorithm {
         // addresses chosen well above this algorithm's own 8 KiB working set (`link.x`'s RAM
         // window is `0x400000..0x402000`), so they can't collide with our own code/data/stack.
         //
-        // Confirmed on real hardware together with masking IRQ/FIQ for the rest of `Init()`
-        // below: repeated full attach -> Init -> erase -> program -> verify cycles (via
-        // `probe-rs download`/`verify` against the real ARM7 JTAG backend) complete without the
-        // SWI-vector trap this used to hit. Masking is left in place rather than restoring the
-        // original I/F state, since nothing after this point needs interrupts enabled.
+        // IRQ/FIQ are also masked for the rest of `Init()` (see below), and left masked rather
+        // than restoring the original I/F state, since nothing after this point needs
+        // interrupts enabled.
         unsafe {
             core::arch::asm!(
                 "mrs r4, cpsr",
@@ -210,9 +208,9 @@ impl FlashAlgorithm for Algorithm {
                 // Back to the original mode, but with IRQ+FIQ masked for the rest of Init()
                 // (deliberately NOT restoring the original I/F state): nothing in the actual
                 // disassembled nvm_detect/nvm_setsvar ROM code paths contains an explicit
-                // svc/swi instruction, so the SWI-vector trap this used to hit partway through
-                // Init() was a stray hardware interrupt, not a ROM-issued SVC. Masking it here
-                // is the fix - see the comment above the mode bank-hop for confirmation.
+                // svc/swi instruction, so an exception vectoring through the SWI/IRQ slots
+                // partway through Init() can only be a stray hardware interrupt, not a
+                // ROM-issued SVC - which masking here prevents.
                 "orr r4, r4, #0xc0",
                 "msr cpsr_c, r4",
                 fiq_sp = const 0x403100u32,

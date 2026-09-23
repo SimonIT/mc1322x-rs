@@ -226,9 +226,8 @@ impl Default for Adc {
 /// this handler for as long as `INT_NUM_ADC` stays pending, and since [`Adc::new`] otherwise
 /// takes care to disable the other three sources ([`CONTROL_SEQ2_IRQ_ENABLE`] etc.), any that
 /// did fire regardless (e.g. a caller reconfiguring `ADC_CONTROL` directly) would livelock
-/// forever if left unacknowledged - see `crate::aes::asm_isr`'s doc comment for the
-/// hardware-confirmed version of this same mistake, made and fixed on this same peripheral
-/// family earlier in the same session.
+/// forever if left unacknowledged - see `crate::aes::asm_isr`'s doc comment for the same
+/// livelock on the AES block.
 ///
 /// Only drains the FIFO (bounded by the FIFO's own fixed 8-word depth, so this always
 /// terminates) when the FIFO bit was actually set, caching each sample by its tagged channel

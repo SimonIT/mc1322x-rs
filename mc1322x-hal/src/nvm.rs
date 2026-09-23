@@ -47,9 +47,8 @@ const CAPACITY: usize = SECTOR_COUNT * SECTOR_SIZE;
 /// step is usually the first thing to actually notice, failing with [`Error::Rom`] wrapping
 /// `gNvmErrVerifyError_c`. Confirm against real hardware behavior (a write+read-back round
 /// trip, not just a read), not board documentation, when porting to a new board (see
-/// `crate::board`'s doc comment) - on the Redbee Econotag, the only board this has been
-/// hardware-verified against so far, `Internal` is correct despite `External` superficially
-/// "working" for detect/read/erase.
+/// `crate::board`'s doc comment) - on the Redbee Econotag, `Internal` is correct despite
+/// `External` superficially "working" for detect/read/erase.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum NvmInterface {
     /// The internal NVM interface (`gNvmInternalInterface_c`).
@@ -140,8 +139,8 @@ impl Nvm {
     /// geometry, without calling the ROM's `nvm_detect` at all.
     ///
     /// Diagnostic escape hatch for boards/situations where `nvm_detect` itself hangs or faults
-    /// (observed when this driver is exercised from code loaded directly into RAM over JTAG,
-    /// bypassing the chip's normal boot sequence) - skips straight to the same SST type
+    /// (e.g. when running from code loaded directly into RAM over JTAG, bypassing the chip's
+    /// normal boot sequence) - skips straight to the same SST type
     /// [`Self::new`] would use anyway if detection succeeded.
     pub fn new_assume_sst() -> Self {
         prepare_flash_access();

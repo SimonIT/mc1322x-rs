@@ -20,9 +20,9 @@
 //! which never happens here — this run loop always re-polls unconditionally, the same reason
 //! `platform-spin`'s own `SpinPender` is a no-op). `embassy-executor`'s `pender_impl!` may only
 //! run once in the whole crate tree: a binary using [`SleepyExecutor`] must **not** also enable
-//! any `platform-*` Cargo feature (e.g. `platform-spin`, which every other example in this
-//! workspace uses for the plain `embassy_executor::Executor`) elsewhere in its dependency
-//! graph, or the two `Pender` registrations conflict at link time.
+//! any `platform-*` Cargo feature (e.g. `platform-spin`, the usual choice for the plain
+//! `embassy_executor::Executor`) elsewhere in its dependency graph, or the two `Pender`
+//! registrations conflict at link time.
 //!
 //! # Known race: a benign latency window, not a hang
 //!
@@ -35,9 +35,8 @@
 //! the `Doze` timer wakes the CPU. Bounded by whatever sleep duration was chosen (at most
 //! [`ticks_until_next_wake`]'s value), not unbounded, and not a correctness bug — just added
 //! latency for that one task, in a narrow, rarely-hit window. Not fixed here: doing so would
-//! need holding a critical section across the idle-check-and-sleep sequence, which is
-//! unverified and out of scope for a first version — see the module's git history/PR
-//! description if this ever needs revisiting.
+//! need holding a critical section across the idle-check-and-sleep sequence, which would also
+//! keep interrupts masked across `sleep()` itself.
 //!
 //! # TMR0 resync
 //!

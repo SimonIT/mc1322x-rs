@@ -1,7 +1,7 @@
 //! A `embedded-hal`-based HAL for the NXP/Freescale MC1322x chip family (MC13224V/MC13226V),
 //! usable on any board built around either part - not tied to one specific board's design.
 //!
-//! Peripheral drivers here (GPIO, UART, SPI, I2C, ADC, AES, PWM, RTC, NVM flash, CRM
+//! Peripheral drivers here (GPIO, UART, SPI, I2C, ADC, AES, PWM, RTC, NVM flash, watchdog, CRM
 //! sleep/wake, the async delay) expose the chip's own registers and behavior; board-specific
 //! choices a caller makes per use (which pins something is wired to, an I2C bus's clock
 //! divider) are always parameters, never hardcoded into a driver - [`i2c::I2c0::
@@ -56,12 +56,14 @@ pub mod i2c;
 pub mod nvm;
 mod power;
 pub mod pwm;
+pub mod reset;
 pub mod rng;
 pub mod rtc;
 pub mod sleep;
 pub mod spi;
 pub mod uart;
 mod util;
+pub mod watchdog;
 
 /// Defines the `extern "C" fn main() -> !` entry point that `libmc1322x`'s `start.S` calls
 /// directly by that exact symbol name, forwarding to `$entry` (a plain `fn() -> !`).

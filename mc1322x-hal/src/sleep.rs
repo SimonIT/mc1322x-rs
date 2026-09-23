@@ -14,17 +14,15 @@
 //!
 //! # Hardware caveat: peripheral clocking is unreliable right after the first sleep/wake cycle
 //!
-//! Hardware-verified (`examples/sleep-selftest`): UART transmits garbled bytes for a while
-//! after the *first* `sleep()`/wake cycle following boot. Ruled out as causes: a leftover
-//! TX-in-flight race, a peripheral clock settling delay (up to ~830ms tested), and the UART
-//! needing re-initialization. What does clear it, reproducibly, is completing further
-//! sleep/wake cycles (Doze or Hibernate, not a fixed count) — not achievable by passively
-//! waiting, however long. This points to a genuine MC1322x CRM/clock-generation quirk (likely
-//! an edge-triggered PLL/divider resync state machine, not one that settles with elapsed time)
-//! rather than a bug in this module. If you rely on a peripheral whose timing derives from the
-//! same clock right after the first post-boot `sleep()` call, verify it independently (e.g. a
-//! JTAG-readable static, as the example does) rather than trusting its output directly, or run
-//! a couple of harmless throwaway sleep/wake cycles first.
+//! UART transmits garbled bytes for a while after the *first* `sleep()`/wake cycle following
+//! boot. It isn't a leftover TX-in-flight race, a peripheral clock settling delay, or the UART
+//! needing re-initialization. What does clear it is completing further sleep/wake cycles
+//! (Doze or Hibernate, not a fixed count) — not passively waiting, however long. This points
+//! to a genuine MC1322x CRM/clock-generation quirk (likely an edge-triggered PLL/divider resync
+//! state machine, not one that settles with elapsed time) rather than a bug in this module. If
+//! you rely on a peripheral whose timing derives from the same clock right after the first
+//! post-boot `sleep()` call, don't trust its output directly - run a couple of harmless
+//! throwaway sleep/wake cycles first.
 
 use mc1322x_sys::CRM_BASE;
 use portable_atomic::{AtomicU32, Ordering};
@@ -287,11 +285,10 @@ pub fn sleep(mode: SleepMode, sources: WakeSources, retention: Retention) -> Wak
         write_reg(STATUS, raw_status);
         let status = Status::from_bits_truncate(raw_status);
 
-        // RTC_WU_EVT is checked before HIB_WU_EVT/DOZE_WU_EVT: hardware-verified (a
-        // 1000-ring-oscillator-tick RTC wake with `TIMER_WU_EN` never set still reported
-        // HIB_WU_EVT set, misclassifying a precisely-on-time RTC wake as `Timer` when checked
-        // in the other order) that a wake-up-timer-class status bit can be set alongside a
-        // genuine RTC wake, contradicting the RM's Table 5-13 description of
+        // RTC_WU_EVT is checked before HIB_WU_EVT/DOZE_WU_EVT: a wake-up-timer-class status
+        // bit can be set alongside a genuine RTC wake (an RTC wake with `TIMER_WU_EN` never
+        // set still reports HIB_WU_EVT, which the other order would misclassify as `Timer`),
+        // contradicting the RM's Table 5-13 description of
         // HIB_WU_EVT/DOZE_WU_EVT as "only set if enabled by TIMER_WU_EN" - either a
         // documentation inaccuracy or an interaction not covered by it. RTC_WU_EN/RTC_WU_IEN
         // being the ones this call actually armed makes `Rtc` the correct answer whenever

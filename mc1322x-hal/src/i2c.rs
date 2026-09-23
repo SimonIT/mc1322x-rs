@@ -60,7 +60,7 @@ impl i2c::Error for Error {
 pub struct I2c0;
 
 impl I2c0 {
-    /// `I2C_FDR[5:0]` divider index (RM Table 14-5) measured at ~150 kHz SCL on the board
+    /// `I2C_FDR[5:0]` divider index (RM Table 14-5) giving ~150 kHz SCL on the board
     /// selected at compile time (`crate::board::I2C_CLOCK_DIVIDER` - see `crate::board`'s doc
     /// comment) - a starting point for [`Self::new`], not a guaranteed rate: the real-world
     /// frequency this produces also depends on bus loading and pull-up strength, which vary
@@ -115,33 +115,29 @@ impl I2c0 {
 
     /// Generate a STOP condition.
     ///
-    /// Hardware-confirmed necessary to do more than the obvious `I2CCR &= !MSTA`: on real
-    /// hardware, `I2C_SR.MBB` (bus busy) was found to stay stuck set after *any* aborted
-    /// transfer (`NoAcknowledge` or `ArbitrationLost`) with only that plain clear — permanently
+    /// Needs to do more than the obvious `I2CCR &= !MSTA`: with only that plain clear,
+    /// `I2C_SR.MBB` (bus busy) stays stuck set after *any* aborted transfer
+    /// (`NoAcknowledge` or `ArbitrationLost`) — permanently
     /// hanging the next transaction's own bus-idle wait forever, sync (tight spin) or async
     /// (yield loop) alike, since per RM §14.8.4 `MBB` only clears "if a STOP condition is
     /// detected" and a plain `MSTA` clear evidently doesn't reliably produce one from this
     /// state on this chip.
     ///
-    /// The fix ported here is `libmc1322x/lib/i2c.c`'s own `i2c_force_reset()` ("force SCL to
+    /// The recovery ported here is `libmc1322x/lib/i2c.c`'s own `i2c_force_reset()` ("force SCL to
     /// become bus master when sda is still low") - a documented reference recovery sequence
-    /// that was written but never actually wired into any transaction path, upstream or in this
-    /// port, and so had never been exercised until this bug surfaced: toggle `I2C_MEN` off then
-    /// back on with `MSTA` already set, plus a dummy `I2CDR` read, which reliably clears the
-    /// stuck `MBB`. On its own this left the module unable to complete any *subsequent*
+    /// that upstream never wires into any transaction path: toggle `I2C_MEN` off then back on
+    /// with `MSTA` already set, plus a dummy `I2CDR` read, which reliably clears the stuck
+    /// `MBB`. On its own this leaves the module unable to complete any *subsequent*
     /// transaction (sync or async), which the reference function's minimal three-write sequence
     /// doesn't address; settling `I2CCR` back to a plain `MEN`-only resting state afterward
-    /// (rather than whatever bits happened to be set beforehand) fixed that too - hardware
-    /// round-tripped through two full transactions in a row, both sync and async, only after
-    /// adding this settle step.
+    /// (rather than whatever bits happened to be set beforehand) fixes that too.
     fn stop(&mut self) {
-        // Hardware-confirmed necessary: with these four steps run back-to-back at full CPU
-        // speed, the recovery silently doesn't take (the very next transaction still hangs on
-        // `MBB` again) - it only worked reliably in testing when there happened to be real
-        // delay between each step (UART prints, in the diagnostic session that found this
-        // sequence). A few hundred cycles' settling time between each register write
-        // empirically fixed it; not derived from any documented timing spec, since the RM
-        // doesn't cover this recovery sequence at all (see this method's doc comment above).
+        // With these four steps run back-to-back at full CPU speed, the recovery silently
+        // doesn't take (the very next transaction still hangs on `MBB` again) - it only works
+        // reliably with real delay between each step. A few hundred cycles' settling time
+        // between each register write is enough; not derived from any documented timing spec,
+        // since the RM doesn't cover this recovery sequence at all (see this method's doc
+        // comment above).
         fn settle() {
             for _ in 0..500u32 {
                 core::hint::black_box(0);
@@ -561,7 +557,7 @@ unsafe fn write_u8(reg: *mut u8, value: u8) {
 /// # Caveats
 ///
 /// Like `mc1322x-embassy`'s `tmr0_isr`, the ROM's `irq()` dispatcher must use interworking
-/// (`bx`) to call this from ARM state into this crate's Thumb code; unverified on hardware.
+/// (`bx`) to call this from ARM state into this crate's Thumb code.
 #[unsafe(no_mangle)]
 extern "C" fn i2c_isr() {
     unsafe {

@@ -295,10 +295,10 @@ impl InputPin for Pin {
 ///
 /// Masks this pin's own `EXT_WU_IEN` bit rather than `EXT_WU_EN`: per RM §5.9.2, "the
 /// status/interrupt request will be cleared immediately upon servicing" once `EXT_WU_IEN` is
-/// disabled — the same real, hardware-confirmed retracting behavior [`crate::delay::rtc_isr`]
+/// disabled — the same retracting behavior [`crate::delay::rtc_isr`]
 /// already relies on for `RTC_WU_IEN` (word-for-word the same description in the RM), unlike
 /// AES's `CONTROL1_MASK_IRQ`, which does *not* retract an already-latched interrupt (see
-/// `crate::aes::asm_isr`'s doc comment for that hardware-confirmed livelock). `STATUS`'s
+/// `crate::aes::asm_isr`'s doc comment for that livelock). `STATUS`'s
 /// `EXT_WU_EVT` bit is left for [`KbiInput::wait_for_edge`]'s next call to clear, exactly as
 /// `rtc_isr` leaves `RTC_WU_EVT` for [`crate::delay::Delay::wait_rtc_ticks`].
 macro_rules! kbi_isr {

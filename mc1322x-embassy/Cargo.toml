@@ -6,7 +6,7 @@ description = "Embassy platform support for the NXP MC1322x"
 
 [dependencies]
 critical-section = { version = "1.2", features = ["restore-state-u32"] }
-embassy-executor = { version = "0.10", features = ["no-ptr-atomic"] }
+embassy-executor = { version = "0.10", features = ["portable-atomic"] }
 embassy-time = { version = "0.5", features = [
   "generic-queue-16",
   "tick-hz-1_000",
@@ -17,6 +17,7 @@ heapless = { version = "0.9", features = ["portable-atomic-critical-section"] }
 mc1322x-hal = { path = "../mc1322x-hal" }
 mc1322x-sys = { path = "../mc1322x-sys" }
 portable-atomic = { version = "1.5", features = ["critical-section"] }
+task-watchdog = { version = "0.1.2", default-features = false, optional = true }
 
 [features]
 # `SleepyExecutor` registers its own `Pender` (see `sleepy_executor.rs`) via `raw::Executor`
@@ -25,8 +26,11 @@ portable-atomic = { version = "1.5", features = ["critical-section"] }
 # would always be compiled in (even for a consumer that never names `SleepyExecutor`), and once
 # a binary pulls in anything else from this crate too (`init()`, `time_driver` - i.e. every real
 # consumer), the linker packs the unused `__pender` into the same link unit anyway and it
-# collides with `platform-spin`'s own `__pender` - hardware-confirmed as a real link error, not
-# a hypothetical. A binary that wants `SleepyExecutor` enables this feature and must not also
+# collides with `platform-spin`'s own `__pender` - a real link error. A binary that wants `SleepyExecutor` enables this feature and must not also
 # enable a `platform-*` feature (e.g. `platform-spin`) anywhere in its dependency graph; a binary
 # that leaves this feature off can use `platform-spin` freely.
 sleepy-executor = []
+# `task_watchdog` module: `embassy-time` clock + async runner for `task-watchdog`, on top of
+# `mc1322x-hal`'s COP backend for it, multiplexing several tasks' liveness onto the one hardware
+# watchdog.
+task-watchdog = ["dep:task-watchdog", "mc1322x-hal/task-watchdog"]

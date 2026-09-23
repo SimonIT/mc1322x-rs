@@ -2,7 +2,7 @@
 name = "mc1322x-hal"
 version = "0.1.0"
 edition = "2024"
-description = "embedded-hal HAL for the NXP/Freescale MC1322x chip family (MC13224V/MC13226V), for any board built around either part"
+description = "HAL for the NXP/Freescale MC1322x chip family (MC13224V/MC13226V)"
 
 [[test]]
 name = "embedded_test"
@@ -22,6 +22,7 @@ fugit = { version = "0.5.0", optional = true }
 mc1322x-sys = { path = "../mc1322x-sys" }
 portable-atomic = { version = "1.5", features = ["critical-section"] }
 rand_core = { version = "0.10.1", default-features = false }
+task-watchdog = { version = "0.1.2", default-features = false, optional = true }
 
 
 [dev-dependencies]
@@ -36,3 +37,4 @@ default = ["board-redbee-econotag"]
 board-redbee-econotag = []
 fugit = ["dep:fugit"]
 embedded-time = ["dep:embedded-time"]
+task-watchdog = ["dep:task-watchdog"]

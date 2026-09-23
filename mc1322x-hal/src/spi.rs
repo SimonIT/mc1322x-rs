@@ -160,20 +160,17 @@ impl Spi {
     /// Arms the ITC's SPI channel (`INT_NUM_SPI`) and waits for [`spi_isr`] to wake this task,
     /// rather than polling.
     ///
-    /// The `INTENNUM` write deliberately runs *outside* the `critical_section::with` block
-    /// below, unlike the completion check and [`WAKER`] arm — hardware-confirmed necessary:
-    /// `mc1322x-hal`'s `critical_section::Impl` (see `crate::critical_section_impl`) saves the
-    /// ITC's single, shared `INTENABLE` register on entry and unconditionally restores that
-    /// saved value on exit. `INTENNUM` is a bit-*set* into that same `INTENABLE` register (RM
-    /// §15.5.5: SPI has no local mask bit, so the ITC channel itself is the only enable/disable
-    /// mechanism), so arming it *inside* a critical section built on that impl gets silently
-    /// undone the instant the section ends — the same bug this project's own notes already
-    /// document for `mc1322x-embassy`'s TMR0 setup, just never previously checked here, since
-    /// this path had never been exercised on real hardware before now (confirmed by reproducing
-    /// the hang first: `spi_isr` genuinely never fired with the old, all-inside-one-`with`
-    /// version). Rearming on every poll (including the one that immediately follows being
-    /// woken) is harmless — `INTENNUM` is a plain "ensure this bit is set" write, not something
-    /// that can double-arm or lose an already-pending completion.
+    /// The `INTENNUM` write deliberately runs *outside* the `critical_section::with` block below,
+    /// unlike the completion check and [`WAKER`] arm — this is necessary: `mc1322x-hal`'s
+    /// `critical_section::Impl` (see `crate::critical_section_impl`) saves the ITC's single, shared
+    /// `INTENABLE` register on entry and unconditionally restores that saved value on exit.
+    /// `INTENNUM` is a bit-*set* into that same `INTENABLE` register (RM §15.5.5: SPI has no local
+    /// mask bit, so the ITC channel itself is the only enable/disable mechanism), so arming it
+    /// *inside* a critical section built on that impl gets silently undone the instant the section
+    /// ends, and `spi_isr` never fires - the same pitfall as `mc1322x-embassy`'s TMR0 setup.
+    /// Rearming on every poll (including the one that immediately follows being woken) is harmless
+    /// — `INTENNUM` is a plain "ensure this bit is set" write, not something that can double-arm or
+    /// lose an already-pending completion.
     ///
     /// The completion check and [`WAKER`] arm still run inside one [`critical_section::with`]
     /// call so a completion landing between them can't be missed — interrupts stay masked for
@@ -313,7 +310,8 @@ impl embedded_hal_async::spi::SpiBus<u8> for Spi {
 ///
 /// # Caveats
 ///
-/// Unverified on hardware, like `crate::i2c::i2c_isr`.
+/// Like `crate::i2c::i2c_isr`, the ROM's `irq()` dispatcher must use interworking (`bx`) to
+/// call this from ARM state into this crate's Thumb code.
 #[unsafe(no_mangle)]
 extern "C" fn spi_isr() {
     unsafe {

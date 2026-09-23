@@ -411,7 +411,8 @@ fn uart_isr_common(uart: *mut UART_struct, wakers: &UartWakers) {
 ///
 /// # Caveats
 ///
-/// Like `crate::i2c::i2c_isr`, unverified on hardware.
+/// Like `crate::i2c::i2c_isr`, the ROM's `irq()` dispatcher must use interworking (`bx`) to
+/// call this from ARM state into this crate's Thumb code.
 #[unsafe(no_mangle)]
 extern "C" fn uart1_isr() {
     uart_isr_common(UART1_BASE as *mut UART_struct, &UART1_WAKERS);
