@@ -1,7 +1,18 @@
+//! Master-mode SPI, implementing the blocking `embedded-hal` and async `embedded-hal-async`
+//! [`SpiBus`] traits.
+//!
+//! # Interrupts
+//!
+//! The async implementation waits on the SPI completion interrupt (`INT_NUM_SPI`), dispatched by
+//! `libmc1322x`'s `irq()` to this module's `spi_isr`.
+
 use core::convert::Infallible;
 use core::task::Poll;
 use embedded_hal::spi::{self, SpiBus};
-use mc1322x_sys::{INTBASE, REF_OSC, gpio_select_function, gpio_set_pad_dir};
+use mc1322x_sys::{
+    INTBASE, INTDISNUM_OFF, INTENNUM_OFF, REF_OSC, gpio_select_function, gpio_set_pad_dir,
+    interrupt_nums_INT_NUM_SPI,
+};
 
 use crate::util::WakerCell;
 
@@ -39,27 +50,17 @@ const SPI_MISO_PIN: u8 = 5;
 const PAD_DIR_INPUT: u8 = 0;
 const PAD_DIR_OUTPUT: u8 = 1;
 
-// ITC (interrupt controller) offset/number for the SPI completion interrupt (see `isr.h`'s
-// `INTENNUM_OFF`/`INTDISNUM_OFF` and `interrupt_nums`), following the same wiring as
-// `crate::i2c`'s `INT_NUM_I2C`. Per the MC1322x Reference Manual §15.5.5: "There is no local
-// mask bit for the SPI_INT. The interrupt for the module is enabled/disabled via the
-// Interrupt Controller (ITC)." So unlike I2C/UART, [`Spi::transfer_word_async`] toggles the
-// ITC channel itself — writing `INT_NUM_SPI` to `INTENNUM` to arm it, and [`spi_isr`] writing
-// it to `INTDISNUM` to quiesce it — the same technique `libmc1322x`'s own small-RX-buffer
-// `uart1_isr`/`uart1_putc` use for UART1's TX interrupt. `irq()` (linked from `libmc1322x`)
-// dispatches to the weak `spi_isr` symbol overridden at the bottom of this file; that
-// dispatch is this crate's own addition (see `mc1322x-sys/libmc1322x/src/isr.c`), not present
-// in upstream `libmc1322x`.
-const INTENNUM_OFF: u32 = 0x8;
-const INTDISNUM_OFF: u32 = 0xC;
-const INT_NUM_SPI: u32 = 10;
+// ITC number of the SPI completion interrupt. SPI_INT has no local mask bit (RM §15.5.5), so
+// unlike I2C/UART, `Spi::transfer_word_async` arms the ITC channel itself via `INTENNUM` and
+// `spi_isr` disables it again via `INTDISNUM`. `irq()` dispatches to the weak `spi_isr` symbol
+// overridden at the bottom of this file; that dispatch exists only in this project's
+// `libmc1322x` fork (`src/isr.c`), not upstream.
+const INT_NUM_SPI: u32 = interrupt_nums_INT_NUM_SPI;
 
 /// Waker for the in-flight [`Spi::transfer_word_async`] call, if any.
 ///
-/// Set (with the ITC's SPI channel armed) by `transfer_word_async` before it returns
-/// `Pending`, and taken and woken by [`spi_isr`] the next time the module raises the
-/// interrupt. A single instance suffices: unlike UART's independent RX/TX FIFOs, this crate's
-/// SPI driver only ever has one transfer in flight.
+/// Set by `transfer_word_async` before it returns `Pending`, woken by [`spi_isr`]. One slot is
+/// enough: there is only one SPI peripheral and one transfer in flight at a time.
 static WAKER: WakerCell = WakerCell::new();
 
 /// SPI bus clock mode.
@@ -77,20 +78,19 @@ pub enum Mode {
 
 /// Master-mode SPI bus on GPIO5 (MISO), GPIO6 (MOSI) and GPIO7 (SCK).
 ///
-/// The chip-select pin (GPIO4) is not managed by this driver: de-assert it by
-/// holding a GPIO output low while a transfer is in progress (i.e. while the
-/// [`Spi`] handle is borrowed for a [`SpiBus`] operation) and release it
-/// afterwards. SPI_SS is held de-asserted at all times.
+/// Chip select is not managed by this driver: GPIO4 (`SPI_SS`) is left in GPIO mode. Drive
+/// chip select from a GPIO output around each transaction yourself, e.g. through an
+/// `embedded-hal-bus` `SpiDevice`.
 pub struct Spi;
 
 impl Spi {
     /// Create a master SPI bus running at up to `frequency` Hz.
     ///
-    /// The SCK divider is chosen as the highest clock rate that does not
-    /// exceed `frequency`, assuming a 24 MHz peripheral reference clock
-    /// (`REF_OSC`, the default `xtal_clkdiv` of 1). Actual rates are
-    /// `REF_OSC / 2^(FREQ+1)` for `FREQ` in 0..=7, i.e. 12 MHz down to
-    /// 93.75 kHz.
+    /// Picks the highest SCK rate that doesn't exceed `frequency`: `REF_OSC / 2^(n + 1)` for
+    /// `n` in 0..=7, i.e. 12 MHz down to 93.75 kHz with the 24 MHz reference oscillator. Below
+    /// 93.75 kHz, the slowest rate is used.
+    ///
+    /// Configures GPIO5 (MISO), GPIO6 (MOSI) and GPIO7 (SCK) for SPI.
     pub fn new(frequency: u32, mode: Mode) -> Self {
         unsafe {
             gpio_select_function(SPI_SCK_PIN, SPI_ALT_FUNCTION);
@@ -111,6 +111,7 @@ impl Spi {
             Mode::Mode3 => SPI_SCK_POL | SPI_SCK_PHASE,
         };
         setup |= 0b11 << SPI_SDO_INACTIVE_ST_SHIFT;
+        // SS_SETUP = 0b10: SPI_SS_OUT held low (RM Table 15-10); the pad isn't muxed to SPI.
         setup |= 0b10 << SPI_SS_SETUP_SHIFT;
 
         unsafe {
@@ -120,8 +121,7 @@ impl Spi {
         Spi
     }
 
-    /// Kick off one 8-bit transfer; the result becomes available once
-    /// [`Self::poll_transfer_status`] reports it.
+    /// Start one 8-bit transfer; [`Self::poll_transfer_status`] reports its completion.
     fn start_transfer(&mut self, tx: u8) {
         unsafe {
             (SPI_TX_DATA as *mut u32).write_volatile((tx as u32) << 24);
@@ -130,11 +130,8 @@ impl Spi {
         }
     }
 
-    /// Check once whether the transfer started by [`Self::start_transfer`] has completed.
-    ///
-    /// Shared by the blocking [`Self::transfer_word`] (spins on this) and the async
-    /// [`Self::transfer_word_async`] (checked once up front, then again each time [`spi_isr`]
-    /// wakes the task).
+    /// Check once whether the transfer started by [`Self::start_transfer`] has completed, and if
+    /// so, clear `SPI_INT` and return the received byte.
     fn poll_transfer_status(&mut self) -> Poll<u8> {
         unsafe {
             if (SPI_STATUS as *const u32).read_volatile() & SPI_INT == 0 {
@@ -155,39 +152,20 @@ impl Spi {
         }
     }
 
-    /// Async equivalent of [`Self::transfer_word`].
+    /// Async equivalent of [`Self::transfer_word`]: waits for [`spi_isr`] instead of polling.
     ///
-    /// Arms the ITC's SPI channel (`INT_NUM_SPI`) and waits for [`spi_isr`] to wake this task,
-    /// rather than polling.
-    ///
-    /// The `INTENNUM` write deliberately runs *outside* the `critical_section::with` block below,
-    /// unlike the completion check and [`WAKER`] arm — this is necessary: `mc1322x-hal`'s
-    /// `critical_section::Impl` (see `crate::critical_section_impl`) saves the ITC's single, shared
-    /// `INTENABLE` register on entry and unconditionally restores that saved value on exit.
-    /// `INTENNUM` is a bit-*set* into that same `INTENABLE` register (RM §15.5.5: SPI has no local
-    /// mask bit, so the ITC channel itself is the only enable/disable mechanism), so arming it
-    /// *inside* a critical section built on that impl gets silently undone the instant the section
-    /// ends, and `spi_isr` never fires - the same pitfall as `mc1322x-embassy`'s TMR0 setup.
-    /// Rearming on every poll (including the one that immediately follows being woken) is harmless
-    /// — `INTENNUM` is a plain "ensure this bit is set" write, not something that can double-arm or
-    /// lose an already-pending completion.
-    ///
-    /// The completion check and [`WAKER`] arm still run inside one [`critical_section::with`]
-    /// call so a completion landing between them can't be missed — interrupts stay masked for
-    /// that inner sequence regardless of `INTENNUM`'s state, so if `SPI_INT` is already set by
-    /// the time the section is entered, `poll_transfer_status` observes it directly rather than
-    /// needing the interrupt to fire at all.
-    ///
-    /// Holds a [`crate::sleep::SleepInhibitGuard`] for as long as the transfer is in flight -
-    /// see that type's doc comment for why a sleep-aware executor must not sleep while this
-    /// module's completion interrupt is what a task is waiting on.
+    /// Holds a [`crate::sleep::SleepInhibitGuard`] while the transfer is in flight.
     async fn transfer_word_async(&mut self, tx: u8) -> u8 {
         self.start_transfer(tx);
         let mut inhibit = None;
         core::future::poll_fn(|cx| {
+            // Arm the ITC channel *outside* the critical section: the critical section restores
+            // the saved `INTENABLE` on exit, which would undo an `INTENNUM` write made inside
+            // it. Re-arming on every poll is harmless.
             unsafe {
                 core::ptr::write_volatile((INTBASE + INTENNUM_OFF) as *mut u32, INT_NUM_SPI);
             }
+            // Check and register the waker atomically, so a completion in between isn't missed.
             critical_section::with(|cs| {
                 if let Poll::Ready(rx) = self.poll_transfer_status() {
                     return Poll::Ready(rx);
@@ -251,9 +229,7 @@ impl SpiBus<u8> for Spi {
     }
 }
 
-/// `embedded-hal-async`'s `SpiBus` reuses `embedded-hal`'s `ErrorType`, so [`spi::ErrorType`]
-/// above already covers it; see [`Spi::transfer_word_async`] for why this waits on the
-/// module's real completion interrupt rather than polling in a loop.
+/// Waits on the SPI completion interrupt between bytes instead of busy-polling.
 impl embedded_hal_async::spi::SpiBus<u8> for Spi {
     async fn read(&mut self, words: &mut [u8]) -> Result<(), Self::Error> {
         for word in words {
@@ -294,24 +270,14 @@ impl embedded_hal_async::spi::SpiBus<u8> for Spi {
 
 /// SPI completion interrupt handler.
 ///
-/// Overrides the weak `spi_isr` symbol this crate adds to `libmc1322x`'s `isr.h`/`isr.c` (see
-/// the comment above `INT_NUM_SPI`) — unlike `i2c_isr`/`uart1_isr`/`uart2_isr`, this dispatch
-/// is not present in upstream `libmc1322x`, so it only exists in this project's fork.
+/// Overrides the weak `spi_isr` symbol in this project's `libmc1322x` fork (see the comment
+/// above `INT_NUM_SPI`).
 ///
-/// This deliberately does *not* touch `SPI_STATUS` itself: [`Spi::poll_transfer_status`] (run
-/// from task context once woken) owns clearing `SPI_INT` and reading the received byte,
-/// exactly as it does for the blocking path, so there's only one place that decides "are we
-/// actually done". Instead this disables the ITC's SPI channel — which deasserts the
-/// interrupt line so `irq()`'s dispatch loop can terminate rather than re-entering this
-/// handler forever — and wakes whichever task armed the wait.
+/// Doesn't touch `SPI_STATUS`: [`Spi::poll_transfer_status`] clears `SPI_INT` and reads the
+/// byte from task context, as on the blocking path. This only disables the ITC's SPI channel,
+/// so `irq()` doesn't re-enter the handler forever, and wakes the waiting task.
 ///
-/// See [`crate::util::WakerCell::wake`] for why waking a waker left behind by a cancelled
-/// (dropped) async transfer future is harmless.
-///
-/// # Caveats
-///
-/// Like `crate::i2c::i2c_isr`, the ROM's `irq()` dispatcher must use interworking (`bx`) to
-/// call this from ARM state into this crate's Thumb code.
+/// `irq()` runs in ARM state and must call this Thumb code with interworking (`bx`).
 #[unsafe(no_mangle)]
 extern "C" fn spi_isr() {
     unsafe {

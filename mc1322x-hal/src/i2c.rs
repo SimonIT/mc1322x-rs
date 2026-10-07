@@ -1,8 +1,11 @@
+//! I2C master (blocking and async).
+
 use core::task::Poll;
 use embedded_hal::i2c::{self, ErrorType, I2c, NoAcknowledgeSource, Operation, SevenBitAddress};
 use mc1322x_sys::{
     I2C_BASE, I2C_CKEN, I2C_MAL, I2C_MBB, I2C_MCF, I2C_MEN, I2C_MIEN, I2C_MIF, I2C_MSTA, I2C_MTX,
-    I2C_RSTA, I2C_RXAK, I2C_SCL, I2C_SDA, I2C_TXAK, INTBASE, gpio_reg_set, gpio_select_function,
+    I2C_RSTA, I2C_RXAK, I2C_SCL, I2C_SDA, I2C_TXAK, INTBASE, INTENNUM_OFF, gpio_reg_set,
+    gpio_select_function, interrupt_nums_INT_NUM_I2C,
 };
 
 use crate::util::{WakerCell, yield_now};
@@ -21,16 +24,11 @@ const GPIO_PAD_PU_SEL0: *mut u32 = 0x8000_0030 as *mut u32;
 
 const I2C_ALT_FUNCTION: u8 = 1;
 
-// ITC (interrupt controller) offset/number for the I2C completion interrupt (see
-// `isr.h`'s `INTENNUM_OFF` and `interrupt_nums`). `irq()` (linked from `libmc1322x`)
-// dispatches it to the weak `i2c_isr` symbol overridden at the bottom of this file.
-const INTENNUM_OFF: u32 = 0x8;
-const INT_NUM_I2C: u32 = 4;
+// ITC (interrupt controller) number of the I2C completion interrupt. `irq()` (linked from
+// `libmc1322x`) dispatches it to the weak `i2c_isr` symbol overridden at the bottom of this file.
+const INT_NUM_I2C: u32 = interrupt_nums_INT_NUM_I2C;
 
-/// Waker for the in-flight [`I2c0::wait_byte_async`] call, if any.
-///
-/// Set (with `I2C_MIEN` armed) by `wait_byte_async` before it returns `Pending`, and taken
-/// and woken by [`i2c_isr`] the next time the module raises the interrupt.
+/// Waker for the in-flight [`I2c0::wait_byte_async`] call, if any; woken by [`i2c_isr`].
 static WAKER: WakerCell = WakerCell::new();
 
 /// I2C master error.
@@ -51,32 +49,31 @@ impl i2c::Error for Error {
     }
 }
 
-/// I2C master on the module 0 instance (SCL = GPIO12, SDA = GPIO13).
+/// I2C master on the I2C module (SCL = GPIO12, SDA = GPIO13).
 ///
-/// The blocking `embedded-hal` [`I2c`] implementation drives the module by polling the
-/// status register. The `embedded-hal-async` implementation instead arms the module's
-/// completion interrupt (`I2C_MIEN`, routed through the ITC as `INT_NUM_I2C`) and waits to be
-/// woken by [`i2c_isr`] — see [`Self::wait_byte_async`] for the arm/wake handshake.
+/// Implements both the blocking `embedded-hal` and the `embedded-hal-async` [`I2c`] traits. The
+/// blocking implementation polls the status register; the async one waits for the I2C
+/// interrupt after each byte, and inhibits a sleep-aware executor from sleeping while waiting
+/// (see [`crate::sleep::SleepInhibitGuard`]).
+///
+/// Only 7-bit addressing is supported.
 pub struct I2c0;
 
 impl I2c0 {
-    /// `I2C_FDR[5:0]` divider index (RM Table 14-5) giving ~150 kHz SCL on the board
-    /// selected at compile time (`crate::board::I2C_CLOCK_DIVIDER` - see `crate::board`'s doc
-    /// comment) - a starting point for [`Self::new`], not a guaranteed rate: the real-world
-    /// frequency this produces also depends on bus loading and pull-up strength, which vary
-    /// even between boards using the same divider index, so this is a per-use parameter to
-    /// [`Self::new`] rather than something applied automatically the way [`crate::power::
-    /// trim_xtal`]'s board-selected trim is.
+    /// Clock divider index for [`Self::new`] giving about 150 kHz SCL on the board selected by the
+    /// `board-*` feature.
+    ///
+    /// The resulting SCL rate also depends on bus loading and pull-up strength, so this is a
+    /// starting point rather than a guaranteed rate.
     pub const BOARD_CLOCK_DIVIDER: u8 = crate::board::I2C_CLOCK_DIVIDER;
 
-    /// Enable the I2C module, mux the SDA/SCL pads to their I2C function and
-    /// activate the internal pull-ups, then return a master-ready instance.
+    /// Create the I2C master.
     ///
-    /// `clock_divider` is the raw `I2C_FDR[5:0]` index selecting the SCL/sampling-rate ratio
-    /// (RM Table 14-5) - this module has no closed-form frequency-to-divider formula (unlike
-    /// [`crate::spi::Spi::new`]'s simple power-of-two divisor), so this takes the index
-    /// directly rather than a target Hz. [`Self::BOARD_CLOCK_DIVIDER`] is a known-working
-    /// starting point on the currently selected board.
+    /// Enables the I2C module, muxes GPIO12/GPIO13 to SCL/SDA, enables their internal pull-ups and
+    /// enables the I2C interrupt in the interrupt controller.
+    ///
+    /// `clock_divider` is the raw `I2C_FDR[5:0]` index selecting the SCL divider (RM Table 14-5);
+    /// [`Self::BOARD_CLOCK_DIVIDER`] is a good default.
     pub fn new(clock_divider: u8) -> Self {
         unsafe {
             // gate the clock to the I2C module
@@ -97,9 +94,8 @@ impl I2c0 {
             gpio_reg_set(GPIO_PAD_PU_SEL0, I2C_SCL as u8);
             gpio_reg_set(GPIO_PAD_PU_SEL0, I2C_SDA as u8);
 
-            // Route the I2C completion interrupt to the core. This only affects the async
-            // path: the peripheral-local enable (`I2C_MIEN`) stays off until
-            // `wait_byte_async` arms it, so the blocking API is unaffected.
+            // Route the I2C interrupt to the core. `I2C_MIEN` stays off until `wait_byte_async`
+            // arms it, so the blocking path is unaffected.
             core::ptr::write_volatile((INTBASE + INTENNUM_OFF) as *mut u32, INT_NUM_I2C);
         }
         I2c0
@@ -113,31 +109,15 @@ impl I2c0 {
         }
     }
 
-    /// Generate a STOP condition.
+    /// Generate a STOP condition and release the bus.
     ///
-    /// Needs to do more than the obvious `I2CCR &= !MSTA`: with only that plain clear,
-    /// `I2C_SR.MBB` (bus busy) stays stuck set after *any* aborted transfer
-    /// (`NoAcknowledge` or `ArbitrationLost`) — permanently
-    /// hanging the next transaction's own bus-idle wait forever, sync (tight spin) or async
-    /// (yield loop) alike, since per RM §14.8.4 `MBB` only clears "if a STOP condition is
-    /// detected" and a plain `MSTA` clear evidently doesn't reliably produce one from this
-    /// state on this chip.
-    ///
-    /// The recovery ported here is `libmc1322x/lib/i2c.c`'s own `i2c_force_reset()` ("force SCL to
-    /// become bus master when sda is still low") - a documented reference recovery sequence
-    /// that upstream never wires into any transaction path: toggle `I2C_MEN` off then back on
-    /// with `MSTA` already set, plus a dummy `I2CDR` read, which reliably clears the stuck
-    /// `MBB`. On its own this leaves the module unable to complete any *subsequent*
-    /// transaction (sync or async), which the reference function's minimal three-write sequence
-    /// doesn't address; settling `I2CCR` back to a plain `MEN`-only resting state afterward
-    /// (rather than whatever bits happened to be set beforehand) fixes that too.
+    /// A plain `MSTA` clear leaves `I2C_SR.MBB` (bus busy) stuck after an aborted transfer
+    /// (no-acknowledge or arbitration loss), hanging the next transaction's bus-idle wait. This
+    /// uses the recovery from `libmc1322x`'s `i2c_force_reset()` instead: toggle `MEN` off and on
+    /// with `MSTA` set plus a dummy `I2CDR` read, then leave `I2CCR` at plain `MEN`.
     fn stop(&mut self) {
-        // With these four steps run back-to-back at full CPU speed, the recovery silently
-        // doesn't take (the very next transaction still hangs on `MBB` again) - it only works
-        // reliably with real delay between each step. A few hundred cycles' settling time
-        // between each register write is enough; not derived from any documented timing spec,
-        // since the RM doesn't cover this recovery sequence at all (see this method's doc
-        // comment above).
+        // The recovery only works with a short delay between the steps. The length is empirical;
+        // the RM doesn't document this sequence.
         fn settle() {
             for _ in 0..500u32 {
                 core::hint::black_box(0);
@@ -154,11 +134,9 @@ impl I2c0 {
         }
     }
 
-    /// Check once whether the module has completed (or failed) the current byte transfer.
+    /// Check once whether the current byte transfer has completed or failed.
     ///
-    /// Shared by the blocking [`Self::wait_byte`] (spins on this) and the async
-    /// [`Self::wait_byte_async`] (checked once up front, then again each time [`i2c_isr`]
-    /// wakes the task).
+    /// Shared by [`Self::wait_byte`] and [`Self::wait_byte_async`]; clears `I2C_MIF`/`I2C_MAL`.
     fn poll_byte_status(&mut self) -> Poll<Result<(), Error>> {
         unsafe {
             let sr = read_u8(I2C_SR);
@@ -186,16 +164,9 @@ impl I2c0 {
 
     /// Async equivalent of [`Self::wait_byte`].
     ///
-    /// Arms the completion interrupt (`I2C_MIEN`) and waits for [`i2c_isr`] to wake this
-    /// task, rather than polling in a loop. The check-then-arm sequence runs inside a single
-    /// [`critical_section::with`] call so a completion landing between the status check and
-    /// enabling the interrupt can't be missed: interrupts stay masked for the whole
-    /// sequence, so if the hardware flag is already set by the time `I2C_MIEN` is written,
-    /// the pending interrupt fires as soon as the critical section ends.
-    ///
-    /// Holds a [`crate::sleep::SleepInhibitGuard`] for as long as the wait is in flight - see
-    /// that type's doc comment for why a sleep-aware executor must not sleep while this
-    /// module's completion interrupt is what a task is waiting on.
+    /// Arms `I2C_MIEN` and waits for [`i2c_isr`]. The check-then-arm sequence runs inside one
+    /// critical section, so a completion between the status check and arming the interrupt fires
+    /// the interrupt as soon as the critical section ends instead of being missed.
     async fn wait_byte_async(&mut self) -> Result<(), Error> {
         let mut inhibit = None;
         core::future::poll_fn(|cx| {
@@ -468,15 +439,9 @@ impl I2c<SevenBitAddress> for I2c0 {
     }
 }
 
-/// `embedded-hal-async`'s `I2c` reuses `embedded-hal`'s `ErrorType`/`Operation`/
-/// `SevenBitAddress`, so [`ErrorType`] above already covers it; only `transaction` itself
-/// needs an async implementation.
-///
-/// Waits on the module's real completion interrupt rather than polling in a loop; see
-/// [`Self::wait_byte_async`] and [`i2c_isr`]. The one exception is the initial
-/// bus-not-busy wait in [`Self::start_async`], which still yields in a loop
-/// ([`yield_now`]): `I2C_MBB` reflects other masters' bus activity, which has no interrupt
-/// of its own on this peripheral.
+/// Waits for the I2C interrupt after each byte instead of polling. The initial wait for the bus
+/// to become idle still polls (yielding to the executor in between), since bus-busy has no
+/// interrupt.
 impl embedded_hal_async::i2c::I2c<SevenBitAddress> for I2c0 {
     async fn transaction(
         &mut self,
@@ -527,37 +492,15 @@ unsafe fn write_u8(reg: *mut u8, value: u8) {
     unsafe { reg.write_volatile(value) }
 }
 
-/// I2C completion interrupt handler.
+/// I2C interrupt handler, overriding the weak `i2c_isr` symbol from `libmc1322x`'s `isr.h`.
 ///
-/// Overrides the weak `i2c_isr` symbol declared in `libmc1322x`'s `isr.h`; the linked
-/// `irq()` handler (`mc1322x-sys/libmc1322x/src/isr.c`) dispatches here whenever
-/// `INT_NUM_I2C` is pending, i.e. whenever `I2C_MIEN` and the module's `I2C_MIF`/`I2C_MAL`
-/// flags are both set.
+/// Doesn't touch `I2C_SR`: [`I2c0::poll_byte_status`] clears the flags from task context, as on
+/// the blocking path. The handler only disables `I2C_MIEN`, which deasserts the interrupt so
+/// `irq()`'s dispatch loop can exit, and wakes the waiter.
 ///
-/// This deliberately does *not* touch `I2C_SR` itself: [`I2c0::poll_byte_status`] (run from
-/// task context once woken) owns clearing those flags, exactly as it does for the blocking
-/// path, so there's only one place that decides "are we actually done". Instead this just
-/// disables `I2C_MIEN` — which deasserts the interrupt line so `irq()`'s dispatch loop can
-/// terminate rather than re-entering this handler forever — and wakes whichever task armed
-/// the wait.
-///
-/// See [`crate::util::WakerCell::wake`] for why waking a waker left behind by a cancelled
-/// (dropped) async I2C future is harmless.
-///
-/// This handler is *unconditionally* linked into any binary that depends on `mc1322x-hal`,
-/// whether or not it ever constructs an [`I2c0`]: `libmc1322x`'s `irq()` (statically linked
-/// via `mc1322x-sys`'s `src.a`, itself linked into every binary regardless of which
-/// peripherals it uses) holds a weak reference to the `i2c_isr` symbol, and once this crate's
-/// strong definition satisfies that reference, the linker cannot discard it even under
-/// `--gc-sections`. [`WAKER`] can nonetheless safely use `critical_section::with` rather than
-/// a hand-rolled mask, because `mc1322x-hal` provides its own `critical_section::Impl` (see
-/// `crate::critical_section_impl`) — every binary that reaches this function already has one
-/// linked in, unconditionally, for the same reason.
-///
-/// # Caveats
-///
-/// Like `mc1322x-embassy`'s `tmr0_isr`, the ROM's `irq()` dispatcher must use interworking
-/// (`bx`) to call this from ARM state into this crate's Thumb code.
+/// This symbol is always linked in (the weak reference from `irq()` keeps it alive under
+/// `--gc-sections`), even in binaries that never use [`I2c0`]. That is fine since this crate
+/// always provides the `critical-section` implementation [`WAKER`] needs.
 #[unsafe(no_mangle)]
 extern "C" fn i2c_isr() {
     unsafe {

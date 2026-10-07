@@ -1,39 +1,35 @@
 //! Embassy platform support for the NXP MC1322x.
 //!
-//! The MC1322x is a single-core ARM7TDMI (ARMv4T) system-on-chip. Because it predates the ARMv7
-//! atomics and its Thumb instruction set cannot mask interrupts from the CPSR directly, every
-//! Embassy port for it needs a [`critical_section`] implementation that masks all interrupts by
-//! clearing the ITC's `INTENABLE` register. That implementation lives in `mc1322x-hal` (as a
-//! private module), not here — `critical_section::Impl` registration is link-wide and singular,
-//! and `mc1322x-hal` is the crate every consumer, HAL or Embassy alike, already needs — so this
-//! crate just depends on it for that side effect (see the `use mc1322x_hal as _;` below).
+//! This crate provides the chip-specific pieces an [`embassy-executor`] application needs:
 //!
-//! What this crate itself provides is a 1 kHz `embassy-time` driver based on a free-running TMR0
-//! compare interrupt ([`time_driver`]).
+//! - a 1 kHz `embassy-time` driver on TMR0 ([`time_driver`], started by [`init`]),
+//! - an optional sleep-aware executor that enters CRM `Doze` while idle (`sleepy_executor`),
+//! - an optional `task-watchdog` integration on the COP hardware watchdog (`task_watchdog`).
 //!
-//! Everything else — the executor, `Spawner`, the `#[task]` macro — comes from the real
-//! [`embassy-executor`](https://docs.rs/embassy-executor) crate, using its `platform-spin` backend
-//! (the MC1322x has no `WFI`/`WFE` instruction, so the thread executor busy-polls instead of
-//! sleeping). `embassy-executor` requires atomics that this chip doesn't have either; this
-//! workspace vendors a small patched copy that plugs the one spot that needed them into
-//! `mc1322x-hal`'s `critical_section` implementation instead (see `vendor/README.md` for what and
-//! why).
+//! The `critical_section` implementation lives in `mc1322x-hal` (it masks all interrupts through
+//! the ITC's `INTENABLE` register, since Thumb code cannot mask them in the CPSR); this crate
+//! links it in by depending on `mc1322x-hal`. The ARMv4T core has no atomic instructions, so
+//! `embassy-executor` is used with its `portable-atomic` feature, which falls back to that
+//! critical section.
 //!
-//! For applications that want the CPU to actually enter CRM `Doze` between polls instead of
-//! busy-polling, [`sleepy_executor::SleepyExecutor`] is an alternative to the plain
-//! `embassy_executor::Executor` above — see its module docs for what it is and isn't safe for
-//! (only pure-timer-plus-`mc1322x-hal`-async-peripheral workloads) and why it can't be combined
-//! with `platform-spin` in the same binary. It's opt-in via this crate's `sleepy-executor`
-//! Cargo feature (off by default) — genuinely opt-in, not just "don't call it": the feature
-//! gates the module's compilation entirely, so a consumer that leaves it off never emits the
-//! `Pender` registration that would otherwise conflict with `platform-spin` at link time
-//! whether or not `SleepyExecutor` is ever actually named in that consumer's own code.
+//! With the plain `embassy_executor::Executor`, the application enables `embassy-executor`'s
+//! `platform-spin` feature: the MC1322x has no `WFI`/`WFE`, so the executor busy-polls.
 //!
-//! With the `task-watchdog` Cargo feature, [`task_watchdog`] plugs the COP hardware watchdog into
-//! the [`task-watchdog`](https://docs.rs/task-watchdog) crate, so several tasks can each be
-//! required to check in before the hardware watchdog gets fed.
+//! [`embassy-executor`]: https://docs.rs/embassy-executor
 //!
-//! # Usage
+//! # Features
+//!
+//! - `defmt`: implement `defmt::Format` for this crate's public types and enable
+//!   `embassy-time/defmt`.
+//! - `sleepy-executor`: enable `sleepy_executor::SleepyExecutor`, which enters CRM `Doze`
+//!   between polls instead of busy-polling. It registers its own executor `Pender`, so a binary
+//!   using this feature must not enable any `embassy-executor` `platform-*` feature (such as
+//!   `platform-spin`), or linking fails with a duplicate `__pender`.
+//! - `task-watchdog`: enable `task_watchdog`, which feeds the COP watchdog only while every
+//!   registered task keeps checking in (built on the
+//!   [`task-watchdog`](https://docs.rs/task-watchdog) crate).
+//!
+//! # Example
 //!
 //! ```ignore
 //! use embassy_executor::{Executor, Spawner};
@@ -57,14 +53,11 @@
 //!     })
 //! }
 //! ```
-//!
-//! (This example can't be compiled as a doctest: it targets a `no_std`, no-`panic_handler`,
-//! bare-metal ARM target that rustdoc's test harness can't build for.)
 
 #![no_std]
+#![warn(missing_docs)]
 
-// Depended on purely for its `critical_section::Impl` side effect (see the module docs above),
-// not for any item this crate's own code calls.
+// Linked in for its `critical_section::Impl`.
 use mc1322x_hal as _;
 
 #[cfg(feature = "sleepy-executor")]
@@ -73,11 +66,9 @@ pub mod sleepy_executor;
 pub mod task_watchdog;
 pub mod time_driver;
 
-/// Bring up the chip-specific Embassy platform pieces.
+/// Initialize the Embassy platform: start the [`time_driver`].
 ///
-/// Currently this just starts the [`time_driver`]; call it once, before running your executor.
-/// Idempotent, and safe to call alongside [`mc1322x_hal::rng::ensure_maca_ready`] or
-/// `Mc1322xRadio::init` (none of them touch each other's hardware).
+/// Call this before running the executor. Calling it again does nothing.
 pub fn init() {
     time_driver::init();
 }

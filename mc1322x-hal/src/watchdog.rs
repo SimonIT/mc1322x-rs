@@ -138,12 +138,13 @@ pub struct Locked;
 /// The COP watchdog. See the module docs.
 ///
 /// [`Self::new`] doesn't touch the hardware: the watchdog stays in whatever state it was in
-/// (stopped, after any reset).
+/// (stopped after any reset).
 pub struct Watchdog {
     _private: (),
 }
 
 impl Watchdog {
+    /// Create a handle to the COP. Doesn't touch the hardware.
     pub fn new() -> Self {
         Self { _private: () }
     }
@@ -154,6 +155,10 @@ impl Watchdog {
     /// If it's already running, it's stopped first, following the RM's procedure for changing
     /// `COP_TIMEOUT` (RM §5.9.5: disable, write the time-out, re-enable - writing the time-out
     /// alone doesn't reset the counter).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Locked`] if [`Self::lock`] has been called since the last reset.
     pub fn start(&mut self, timeout: Timeout) -> Result<(), Locked> {
         self.stop()?;
         let timeout = (timeout.0 as u32) << TIMEOUT_SHIFT;
@@ -167,6 +172,10 @@ impl Watchdog {
     }
 
     /// Stop the watchdog. Does nothing if it's already stopped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Locked`] if [`Self::lock`] has been called since the last reset.
     pub fn stop(&mut self) -> Result<(), Locked> {
         let cntl = read_cntl();
         if cntl & CopCntl::COP_WP.bits() != 0 {

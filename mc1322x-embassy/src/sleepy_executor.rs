@@ -1,86 +1,73 @@
-//! A sleep-aware `embassy-executor`: enters CRM `Doze` between polls when nothing is
-//! immediately runnable, instead of spin-polling like `embassy-executor`'s `platform-spin`.
+//! A sleep-aware executor that enters CRM `Doze` between polls when nothing is runnable,
+//! instead of busy-polling like `embassy-executor`'s `platform-spin`.
 //!
-//! # Only sound for pure-timer workloads
+//! # Limitations
 //!
-//! [`SleepyExecutor`] only checks `mc1322x_hal::sleep::SleepInhibitGuard::count()` before
-//! sleeping — every async peripheral wait in `mc1322x-hal` (`uart`, `spi`, `i2c`, `delay`,
-//! `aes`, `adc`, `gpio`'s `KbiInput`) holds one for as long as its wait is in flight, so sleep
-//! is correctly refused whenever one of those is pending (sleeping would cut the peripheral's
-//! clock and it could never raise the completion interrupt the wait depends on). This makes
-//! [`SleepyExecutor`] safe to use with tasks that mix `embassy-time` timers and those async
-//! peripheral waits — but note what the guard does *not* cover: any interrupt-driven wait
-//! written *outside* `mc1322x-hal` (a future board-specific driver, or hand-rolled ISR/waker
-//! code) that doesn't also hold a `SleepInhibitGuard` would hang exactly the same way, silently.
+//! [`SleepyExecutor`] only sleeps while
+//! [`SleepInhibitGuard::count`](mc1322x_hal::sleep::SleepInhibitGuard::count) is zero. Every
+//! async peripheral wait in `mc1322x-hal` (`uart`, `spi`, `i2c`, `delay`, `aes`, `adc`, `gpio`'s
+//! `KbiInput`) holds a guard while it is in flight, because the peripheral loses its clock in
+//! `Doze` and could never raise the interrupt the wait depends on. Tasks may therefore mix
+//! `embassy-time` timers with those waits. Any other interrupt-driven wait (a custom driver or
+//! hand-written ISR/waker) is not covered and hangs if the executor sleeps while it is pending.
 //!
 //! # `platform-spin` conflict
 //!
-//! [`SleepyExecutor`] registers its own no-op [`embassy_executor::pender::Pender`] (the
-//! "pend" callback only matters for waking a *sleeping* executor thread from another context,
-//! which never happens here — this run loop always re-polls unconditionally, the same reason
-//! `platform-spin`'s own `SpinPender` is a no-op). `embassy-executor`'s `pender_impl!` may only
-//! run once in the whole crate tree: a binary using [`SleepyExecutor`] must **not** also enable
-//! any `platform-*` Cargo feature (e.g. `platform-spin`, the usual choice for the plain
-//! `embassy_executor::Executor`) elsewhere in its dependency graph, or the two `Pender`
-//! registrations conflict at link time.
+//! [`SleepyExecutor`] registers its own [`embassy_executor::pender::Pender`] with
+//! `pender_impl!`, which may only happen once per binary. A binary using it must not enable any
+//! `embassy-executor` `platform-*` feature (e.g. `platform-spin`) anywhere in its dependency
+//! graph, or the two registrations conflict at link time.
 //!
-//! # Known race: a benign latency window, not a hang
+//! # Wake-ups between polling and sleeping
 //!
-//! Between `raw::Executor::poll()` returning "nothing runnable" and [`mc1322x_hal::sleep::sleep`]
-//! actually committing to low-power mode, interrupts stay fully enabled — a peripheral
-//! interrupt landing in that narrow window is serviced normally (nothing is lost; the
-//! peripheral's own hardware FIFO/latch holds whatever it received, and the corresponding
-//! waker fires, making its task ready), but this run loop has no way to notice that before
-//! calling `sleep()` anyway, so that now-ready task doesn't actually get polled again until
-//! the `Doze` timer wakes the CPU. Bounded by whatever sleep duration was chosen (at most
-//! [`ticks_until_next_wake`]'s value), not unbounded, and not a correctness bug — just added
-//! latency for that one task, in a narrow, rarely-hit window. Not fixed here: doing so would
-//! need holding a critical section across the idle-check-and-sleep sequence, which would also
-//! keep interrupts masked across `sleep()` itself.
+//! An interrupt can wake a task after `raw::Executor::poll()` has returned but before the run
+//! loop decides to sleep - most often the 1 kHz TMR0 tick waking a timer that just came due.
+//! Sleeping then would leave that task unpolled for the whole sleep. To prevent this, the
+//! [`Pender`] (called by `embassy-executor` whenever a wake makes a task runnable) sets a flag
+//! that is cleared before every poll, and the run loop checks that flag, picks the sleep
+//! duration and calls [`mc1322x_hal::sleep::sleep_with`] inside one critical section.
+//! `sleep_with` busy-waits on CRM status bits rather than on an interrupt, so masking interrupts
+//! across it is fine; anything that becomes pending meanwhile is serviced when the critical
+//! section ends.
 //!
 //! # TMR0 resync
 //!
-//! TMR0 (the `embassy-time` tick source) does not survive `Doze`/`Hibernate` — only the CRM's
-//! own dedicated sleep timer does (RM §5.2.3/§5.3) — so every sleep cycle here reconfigures it
-//! from scratch and advances the time driver's tick count by exactly the duration this code
-//! itself chose and armed as the wake-up timeout, rather than trying to re-derive elapsed time
-//! from TMR0's meaningless post-wake state. See `crate::time_driver::resync_after_sleep`.
+//! TMR0 (the `embassy-time` tick source) stops in `Doze`; only the CRM sleep timer keeps running
+//! (RM §5.2.3, §5.3). After every sleep, TMR0 is reconfigured from scratch and the tick count is
+//! advanced by the time the sleep timer measured, which includes the wake-up sequence that runs
+//! past the programmed timeout.
 
 use core::ptr;
+use core::sync::atomic::Ordering;
 
 use embassy_executor::pender::Pender;
 use embassy_executor::{Spawner, pender_impl, raw};
-use mc1322x_hal::sleep::{
-    RamRetention, Retention, SleepInhibitGuard, SleepMode, WakeSources, sleep,
-};
+use mc1322x_hal::sleep::{RamRetention, Retention, SleepInhibitGuard, SleepMode, WakeSources, sleep_with};
+use portable_atomic::AtomicBool;
 
 use crate::time_driver;
+
+/// Set whenever a task was woken since the start of the last poll.
+static PENDED: AtomicBool = AtomicBool::new(false);
 
 struct SleepyPender;
 
 impl Pender for SleepyPender {
-    fn pend(_context: *mut ()) {}
+    fn pend(_context: *mut ()) {
+        PENDED.store(true, Ordering::Release);
+    }
 }
 
 pender_impl!(SleepyPender);
 
-/// `Doze` runs off the reference oscillator ÷128 (RM §5.2.3 - see `mc1322x_hal::sleep`'s module
-/// doc for the Hibernate/Doze trade-off; `Doze` is used here for its accurate wake delay, no
-/// crystal needed).
-const DOZE_CLOCK_HZ: u64 = 24_000_000 / 128;
-/// `embassy-time`'s tick rate (matches `mc1322x-embassy::time_driver`'s own `TICK_HZ`).
-const TICK_HZ: u64 = 1_000;
-
 /// Minimum idle stretch worth actually sleeping for, in `embassy-time` ticks (milliseconds).
 ///
-/// Below this, the CRM sleep/wake handshake's own overhead (RM §5.3.1/§5.3.2: hardware
-/// synchronizing `SLEEP_SYNC` on entry and exit, up to a couple of sleep-clock cycles each way)
-/// and the accumulated exposure to further sleep/wake cycles (`mc1322x_hal::sleep`'s
-/// documented, permanent UART-clocking quirk after the *first* post-boot cycle) aren't worth it
-/// for a nap this short. Not exposed as a tuning knob for this first version.
+/// Shorter naps aren't worth the CRM sleep/wake handshake overhead (RM §5.3.1, §5.3.2) or the
+/// extra exposure to `mc1322x_hal::sleep`'s peripheral-clocking caveat after the first
+/// sleep/wake cycle.
 const MIN_SLEEP_TICKS: u64 = 20;
 
-/// A sleep-aware executor. See the module docs for what this is and isn't safe for.
+/// Executor that enters CRM `Doze` while idle. See the module docs for its limitations.
 pub struct SleepyExecutor {
     inner: raw::Executor,
 }
@@ -95,51 +82,58 @@ impl SleepyExecutor {
 
     /// Run the executor.
     ///
-    /// Same shape as `embassy_executor::Executor::run` (see its docs for why this needs
-    /// `&'static mut self` and how to obtain that, e.g. via a `static_cell::StaticCell`): the
-    /// `init` closure spawns the initial task(s), then this polls forever, entering `Doze`
-    /// between polls whenever nothing is immediately runnable, no async peripheral wait is in
-    /// flight, and a `embassy-time` timer is scheduled at least [`MIN_SLEEP_TICKS`] away. Never
-    /// returns.
+    /// Like `embassy_executor::Executor::run`: `init` spawns the initial tasks, then this polls
+    /// forever. Between polls it enters `Doze` whenever no task is runnable, no `mc1322x-hal`
+    /// async peripheral wait is in flight, and the next `embassy-time` timer is at least 20 ms
+    /// away. It never sleeps without a timer scheduled. Get the `&'static mut self` from e.g. a
+    /// `static_cell::StaticCell`.
     pub fn run(&'static mut self, init: impl FnOnce(Spawner)) -> ! {
         init(self.inner.spawner());
 
         loop {
+            PENDED.store(false, Ordering::Release);
             unsafe { self.inner.poll() };
 
-            if SleepInhibitGuard::count() != 0 {
-                continue;
-            }
-            let Some(ticks) = time_driver::ticks_until_next_wake() else {
-                continue;
-            };
-            if ticks < MIN_SLEEP_TICKS {
-                continue;
-            }
+            // Interrupts stay masked from the `PENDED` check until after the resync, so nothing
+            // can wake a task in between (see the module docs), and no TMR0 interrupt left over
+            // from before the sleep runs against TMR0's meaningless post-wake state.
+            critical_section::with(|cs| {
+                if PENDED.load(Ordering::Acquire) || SleepInhibitGuard::count() != 0 {
+                    return;
+                }
+                let Some(ticks) = time_driver::ticks_until_next_wake(cs) else {
+                    return;
+                };
+                if ticks < MIN_SLEEP_TICKS {
+                    return;
+                }
+                let Some(doze_ticks) = time_driver::doze_ticks_until_next_wake(cs) else {
+                    return;
+                };
 
-            let doze_ticks = ((ticks * DOZE_CLOCK_HZ) / TICK_HZ).min(u32::MAX as u64) as u32;
-            sleep(
-                SleepMode::Doze,
-                WakeSources {
-                    timer: Some(doze_ticks),
-                    ..Default::default()
-                },
-                // Full retention: an executor sleeping mid-task must resume every task's stack
-                // and state exactly, not cold-restart - not exposed as a tuning knob for this
-                // first version.
-                Retention {
-                    mcu: true,
-                    gpio_pads: true,
-                    ram: RamRetention::Kb96,
-                },
-            );
-            // Resynced unconditionally, not gated on the returned `WakeReason`: `timer` is the
-            // only wake source armed above, so whatever woke `sleep` (barring some
-            // undocumented hardware fluke misclassifying it) did so after approximately
-            // `ticks` elapsed - and leaving TMR0/`base` un-resynced on a misclassification
-            // would silently break `now()` forever after, which is worse than a rare,
-            // approximately-correct resync.
-            time_driver::resync_after_sleep(ticks);
+                let mut counts_before_sleep = 0;
+                // `Doze` rather than `Hibernate`: its sleep timer runs off the reference
+                // oscillator, so the wake delay is accurate without a 32 kHz crystal.
+                sleep_with(
+                    SleepMode::Doze,
+                    WakeSources {
+                        timer: Some(doze_ticks),
+                        ..Default::default()
+                    },
+                    // Full retention: every task's stack and state must survive the sleep.
+                    Retention {
+                        mcu: true,
+                        gpio_pads: true,
+                        ram: RamRetention::Kb96,
+                    },
+                    // TMR0's position in the current tick, taken at the last moment before the
+                    // clocks stop so no time between it and power-down goes uncounted.
+                    || counts_before_sleep = time_driver::counts_before_sleep(cs),
+                );
+                // Resync regardless of the `WakeReason`: the sleep timer measures the actual sleep
+                // whatever ended it, and TMR0 must be reconfigured after any wake.
+                time_driver::resync_after_sleep(counts_before_sleep);
+            });
         }
     }
 }

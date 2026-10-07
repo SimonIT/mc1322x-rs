@@ -1,3 +1,6 @@
+//! probe-rs flash algorithm for the MC1322x's serial flash, driving it through the boot ROM's
+//! `nvm_*` routines.
+
 #![no_std]
 #![no_main]
 
@@ -5,12 +8,12 @@ use flash_algorithm::*;
 
 mod rom_vectors;
 
-// Macro to replace rprintln - no-op on ARM7TDMI (no RTT support without atomics)
+// No-op stand-in for `rprintln!`: RTT needs atomics, which ARM7TDMI lacks.
 macro_rules! debug {
     ($($arg:tt)*) => {{}};
 }
 
-// MC1322x NVM (Non-Volatile Memory) types
+// Flash chip types reported by `nvm_detect`.
 #[repr(u32)]
 #[derive(Copy, Clone, Debug)]
 enum NvmType {
@@ -21,13 +24,8 @@ enum NvmType {
 }
 
 impl NvmType {
-    /// Converts a raw ROM-detected NVM type code to `NvmType`, or `None` if
-    /// it doesn't match one of the defined discriminants.
-    ///
-    /// `nvm_detect` writes this code through a raw `*mut u32` (not
-    /// `*mut NvmType` directly) precisely so this conversion can happen
-    /// safely: reinterpreting an arbitrary ROM-written value as an enum is
-    /// undefined behavior the moment it doesn't match a defined discriminant.
+    /// Convert the code `nvm_detect` wrote, or `None` for an unknown one. (`nvm_detect` writes
+    /// through a `*mut u32` so an unexpected value can't become an invalid enum.)
     fn from_raw(code: u32) -> Option<Self> {
         Some(match code {
             0 => NvmType::NoNvm,
@@ -39,10 +37,7 @@ impl NvmType {
     }
 }
 
-// NVM Interface types (mirrors libmc1322x's `nvmInterface_t`: `gNvmInternalInterface_c`/
-// `gNvmExternalInterface_c`). Only `Internal` is ever passed by this algorithm (external NVM
-// chips aren't supported here), but the variant is kept to faithfully represent the ROM's real
-// parameter type.
+// libmc1322x's `nvmInterface_t`. Only `Internal` is used.
 #[repr(u32)]
 #[derive(Copy, Clone, Debug)]
 enum NvmInterface {
@@ -51,7 +46,7 @@ enum NvmInterface {
     External = 1,
 }
 
-// NVM Error codes
+// ROM `nvm_*` status codes (libmc1322x's `nvmErr_t`).
 #[repr(u32)]
 #[derive(Copy, Clone, Debug, PartialEq)]
 enum NvmErr {
@@ -64,21 +59,12 @@ enum NvmErr {
     AddressSpaceOverflow = 6,
     BlankCheckError = 7,
     RestrictedArea = 8,
-    /// Not a real ROM status code: returned by [`NvmErr::from_raw`] for any
-    /// raw value the ROM isn't documented to return, so an unexpected code
-    /// surfaces as a hard error instead of an invalid enum discriminant.
+    /// Not a ROM status code: any undocumented value, see [`NvmErr::from_raw`].
     Unknown = 9,
 }
 
 impl NvmErr {
-    /// Converts a raw ROM return code to `NvmErr`.
-    ///
-    /// The ROM functions are declared to return a raw `u32` (not `NvmErr`
-    /// directly) precisely so this conversion can happen safely: reinterpreting
-    /// an arbitrary FFI return value as an enum is undefined behavior the
-    /// moment the value doesn't match one of the enum's defined discriminants,
-    /// and the ROM's behavior for combinations of interface/NVM type/address
-    /// outside what's been exercised isn't guaranteed.
+    /// Convert a raw ROM return code; unknown values become [`NvmErr::Unknown`].
     fn from_raw(code: u32) -> Self {
         match code {
             0 => NvmErr::NoError,
@@ -104,30 +90,23 @@ const CRM_STATUS: *const u32 = (CRM_BASE + 0x18) as *const u32;
 const VREG_1P5V_RDY: u32 = 1 << 19;
 const VREG_1P8V_RDY: u32 = 1 << 18;
 
-// ROM function pointers (THUMB mode functions in MC13224V ROM)
-// These addresses are for MC13224V ROM and are fixed
-// Return `u32`, not `NvmErr`, across the FFI boundary: reinterpreting an
-// arbitrary ROM return value directly as an enum is undefined behavior if it
-// doesn't match one of `NvmErr`'s defined discriminants. Call sites convert
-// via `NvmErr::from_raw`.
+// Boot ROM routines (Thumb). They return a raw `u32` rather than `NvmErr`, since an unexpected
+// value would be an invalid enum; callers convert with `NvmErr::from_raw`.
 type NvmDetectFn = unsafe extern "C" fn(NvmInterface, *mut u32) -> u32;
 type NvmWriteFn = unsafe extern "C" fn(NvmInterface, NvmType, *const u8, u32, u32) -> u32;
 type NvmEraseFn = unsafe extern "C" fn(NvmInterface, NvmType, u32) -> u32;
 type NvmVerifyFn = unsafe extern "C" fn(NvmInterface, NvmType, *const u8, u32, u32) -> u32;
 type NvmSetSvarFn = unsafe extern "C" fn(u32);
 
-// ROM function addresses (must add 1 for THUMB mode)
+// ROM function addresses, with bit 0 set for Thumb.
 const NVM_DETECT_ADDR: u32 = 0x00006cb9 | 1;
 const NVM_WRITE_ADDR: u32 = 0x00006ec5 | 1;
 const NVM_ERASE_ADDR: u32 = 0x00006e05 | 1;
 const NVM_VERIFY_ADDR: u32 = 0x00006f85 | 1;
 const NVM_SETSVAR_ADDR: u32 = 0x00007085 | 1;
 
-/// ROM-internal RAM state initializer, called by libmc1322x's `start.S` before anything else
-/// (even before clearing BSS) whenever `USE_ROM_VARS` is set. ARM-mode (not Thumb, no `| 1`) -
-/// called via a plain `bx`/`blx` in `start.S`. Must run before any `nvm_*` ROM call, or those
-/// calls' use of the ROM's own scratch RAM (see `rom_vectors`) is working off uninitialized
-/// state.
+/// Initializes the ROM's RAM variables (see `rom_vectors`); must run before any `nvm_*` call.
+/// libmc1322x's `start.S` calls it first thing when `USE_ROM_VARS` is set. ARM code, so no `| 1`.
 type RomDataInitFn = unsafe extern "C" fn();
 const ROM_DATA_INIT_ADDR: u32 = 0x000108d0;
 
@@ -158,17 +137,11 @@ impl FlashAlgorithm for Algorithm {
     fn new(_address: u32, _clock: u32, _function: Function) -> Result<Self, ErrorCode> {
         debug!("MC1322x Flash Algorithm Init");
 
-        // libmc1322x's start.S sets up a real, distinct stack pointer for every ARM7TDMI
-        // privileged mode (FIQ/IRQ/SVC/UND/ABT, plus SYS) before ever calling `rom_data_init` -
-        // probe-rs's `call_function` only ever sets the *current* mode's SP. If `rom_data_init`
-        // internally switches modes and pushes/pops through a banked SP we never initialized, it
-        // would read/write through whatever garbage that register bank happens to hold. Scratch
-        // addresses chosen well above this algorithm's own 8 KiB working set (`link.x`'s RAM
-        // window is `0x400000..0x402000`), so they can't collide with our own code/data/stack.
-        //
-        // IRQ/FIQ are also masked for the rest of `Init()` (see below), and left masked rather
-        // than restoring the original I/F state, since nothing after this point needs
-        // interrupts enabled.
+        // Give every banked exception mode its own stack, like libmc1322x's start.S does before
+        // `rom_data_init`: probe-rs only sets the current mode's SP, and a ROM routine switching
+        // modes would otherwise push through an uninitialized SP. The stacks sit above this
+        // algorithm's RAM window (`link.x`: `0x400000..0x402000`). IRQ and FIQ stay masked
+        // afterwards, so a stray interrupt can't vector into the trap table mid-`Init()`.
         unsafe {
             core::arch::asm!(
                 "mrs r4, cpsr",
@@ -205,12 +178,7 @@ impl FlashAlgorithm for Algorithm {
                 "msr cpsr_c, r5",
                 "ldr sp, ={abt_sp}",
 
-                // Back to the original mode, but with IRQ+FIQ masked for the rest of Init()
-                // (deliberately NOT restoring the original I/F state): nothing in the actual
-                // disassembled nvm_detect/nvm_setsvar ROM code paths contains an explicit
-                // svc/swi instruction, so an exception vectoring through the SWI/IRQ slots
-                // partway through Init() can only be a stray hardware interrupt, not a
-                // ROM-issued SVC - which masking here prevents.
+                // Back to the original mode, with IRQ+FIQ left masked.
                 "orr r4, r4, #0xc0",
                 "msr cpsr_c, r4",
                 fiq_sp = const 0x403100u32,
@@ -223,10 +191,7 @@ impl FlashAlgorithm for Algorithm {
             );
         }
 
-        // Initialize the ROM's own internal RAM state before touching any nvm_* ROM call -
-        // mirrors libmc1322x's start.S, which calls this before anything else (even before
-        // clearing its own BSS). See `rom_vectors` for the matching patch-vector stubs this
-        // depends on also being present.
+        // Initialize the ROM's RAM variables before any `nvm_*` call, like libmc1322x's start.S.
         let rom_data_init: RomDataInitFn = unsafe { core::mem::transmute(ROM_DATA_INIT_ADDR) };
         unsafe { rom_data_init() };
 
@@ -290,9 +255,8 @@ impl FlashAlgorithm for Algorithm {
     fn erase_all(&mut self) -> Result<(), ErrorCode> {
         debug!("Erase All");
 
-        // Erase all sectors using sector bitmask, except the top sector (bit
-        // 31), which is reserved for factory use (see libmc1322x's
-        // flasher.c, which uses the same 0x7fffffff mask).
+        // Erase every sector except the reserved top one (bit 31), with the same 0x7fffffff mask
+        // as libmc1322x's flasher.c.
         let nvm_erase: NvmEraseFn = unsafe { core::mem::transmute(NVM_ERASE_ADDR) };
 
         let result = NvmErr::from_raw(unsafe {
@@ -359,8 +323,7 @@ impl FlashAlgorithm for Algorithm {
 
         let nvm_write: NvmWriteFn = unsafe { core::mem::transmute(NVM_WRITE_ADDR) };
 
-        // Call ROM nvm_write function
-        // Returns error count (0 = success)
+        // Nonzero means failure.
         let error_count = unsafe {
             nvm_write(
                 NvmInterface::Internal,
@@ -384,8 +347,7 @@ impl FlashAlgorithm for Algorithm {
     fn verify(&mut self, address: u32, size: u32, data: Option<&[u8]>) -> Result<(), u32> {
         debug!("Verify addr: 0x{:08x}, size: {}", address, size);
 
-        // Nothing supplied to compare against (e.g. a host tool checking whether the
-        // region is programmed at all, without caring what it holds) - nothing to do.
+        // No data to compare against: nothing to verify.
         let Some(data) = data else {
             return Ok(());
         };
@@ -399,9 +361,7 @@ impl FlashAlgorithm for Algorithm {
             return Err(address);
         }
 
-        // The ROM's own verify routine (same call shape as nvm_write, comparing flash
-        // contents against `data` byte-for-byte) rather than reading flash back through
-        // nvm_read and comparing here, since it's the ROM API purpose-built for this.
+        // `nvm_verify` compares flash against `data` in the ROM.
         let nvm_verify: NvmVerifyFn = unsafe { core::mem::transmute(NVM_VERIFY_ADDR) };
 
         let result = NvmErr::from_raw(unsafe {
@@ -418,8 +378,7 @@ impl FlashAlgorithm for Algorithm {
 
         if result != NvmErr::NoError {
             debug!("Verify failed at address 0x{:08x}", address);
-            // The ROM only reports a pass/fail status, not the mismatching byte's
-            // location, so report the start of the failing region.
+            // The ROM doesn't report where the mismatch is; report the region start.
             return Err(address);
         }
 
@@ -430,6 +389,5 @@ impl FlashAlgorithm for Algorithm {
 impl Drop for Algorithm {
     fn drop(&mut self) {
         debug!("MC1322x Flash Algorithm Uninit");
-        // No special cleanup required
     }
 }

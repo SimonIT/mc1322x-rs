@@ -1,19 +1,12 @@
-//! Board-specific constants for the Redbee Econotag. Selected at compile time by the
-//! `board-redbee-econotag` Cargo feature (on by default) - see `src/lib.rs`'s `mod board`
-//! declaration.
-//!
-//! A new board gets its own sibling file here (e.g. `board/my_board.rs`) plus a matching
-//! `board-my-board` feature and `#[path = "board/my_board.rs"]` arm in `lib.rs`, providing the
-//! same set of items this file does.
+//! Board-specific constants for the Redbee Econotag (feature `board-redbee-econotag`).
 
 use crate::nvm::NvmInterface;
 use crate::power::XtalTrim;
 
-/// 24 MHz reference crystal trim (see `power::XtalTrim`'s doc comment for what this
-/// compensates for). Replicates `trim_xtal()` (`mc1322x-sys/libmc1322x/src/
-/// default_lowlevel.h`'s `pack_XTAL_CNTL(CTUNE_4PF, CTUNE, FTUNE, IBIAS)` macro) using
-/// `board/redbee-econotag.h`'s `CTUNE_4PF`/`CTUNE`/`FTUNE`, and `board/std_conf.h`'s `IBIAS`
-/// default, which Econotag doesn't override.
+/// 24 MHz reference crystal trim.
+///
+/// Values from `libmc1322x`'s `board/redbee-econotag.h` (`CTUNE_4PF`, `CTUNE`, `FTUNE`) and the
+/// `IBIAS` default from `board/std_conf.h`.
 pub(crate) const XTAL_TRIM: XtalTrim = XtalTrim {
     ctune_4pf: 1,
     ctune: 11,
@@ -21,16 +14,13 @@ pub(crate) const XTAL_TRIM: XtalTrim = XtalTrim {
     ibias: 0x1F,
 };
 
-/// Which bus this board's serial flash is wired to (see `nvm::NvmInterface`'s doc comment for
-/// why picking the wrong one matters and is easy to get wrong silently). `External` (GPIO4-7)
-/// reads back a floating-bus pattern (0x00, consistent but not real data) that makes
-/// `erase`/`read` falsely report success, while `write`'s internal verify step catches the
-/// mismatch (`gNvmErrVerifyError_c`); `Internal` reads back proper 0xFF post-erase and
-/// verifies real writes correctly.
+/// Bus the board's serial flash is wired to.
+///
+/// The Econotag uses the internal interface. With `External` (GPIO4-7) the driver reads a
+/// floating bus on this board: erase and read appear to succeed, only write's verify fails.
 pub(crate) const NVM_INTERFACE: NvmInterface = NvmInterface::Internal;
 
-/// `I2C_FDR[5:0]` divider index (RM Table 14-5) giving ~150 kHz SCL on this board - see
-/// `i2c::I2c0::BOARD_CLOCK_DIVIDER`'s doc comment for why the real-world frequency this
-/// produces also depends on bus loading and pull-up strength, i.e. is board-specific in a way
-/// that can't be computed from the chip alone.
+/// `I2C_FDR[5:0]` divider index (RM Table 14-5) giving about 150 kHz SCL on this board.
+///
+/// The actual SCL rate also depends on bus loading and pull-up strength.
 pub(crate) const I2C_CLOCK_DIVIDER: u8 = 0x20;

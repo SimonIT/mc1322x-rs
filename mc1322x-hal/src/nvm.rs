@@ -1,3 +1,8 @@
+//! Serial flash (NVM) access through the boot ROM's `nvm_*` routines.
+//!
+//! [`Nvm`] implements `embedded-storage`'s [`NorFlash`]/[`ReadNorFlash`] for the SST-compatible
+//! serial flash (32 sectors of 4096 bytes, 128 KiB) that MC1322x boards boot from.
+
 use core::ffi::c_void;
 use embedded_storage::nor_flash::{
     ErrorType, NorFlash, NorFlashError, NorFlashErrorKind, ReadNorFlash, check_erase, check_read,
@@ -12,12 +17,10 @@ use mc1322x_sys::{
 
 use crate::power::power_up_regulators;
 
-/// Power up the regulators the ROM's `nvm_*` routines need, and clear the ROM's internal
-/// "secure variable" state they also require.
+/// Power up the regulators the ROM's `nvm_*` routines need, then call `nvm_setsvar(0)`.
 ///
-/// The `nvm_setsvar(0)` call is unconditionally required, regardless of interface, matching
-/// the ROM's own `nvm-read.c` reference flow's call order (right after regulator ready,
-/// before `nvm_detect`).
+/// `nvm_setsvar(0)` is required regardless of interface; the order (after the regulators are
+/// ready, before `nvm_detect`) follows `libmc1322x`'s `nvm-read.c`.
 fn prepare_flash_access() {
     power_up_regulators();
     unsafe {
@@ -34,21 +37,16 @@ const CAPACITY: usize = SECTOR_COUNT * SECTOR_SIZE;
 
 /// Which bus the boot ROM's `nvm_*` routines drive.
 ///
-/// The MC1322x has no on-die flash: `nvm_detect`/`nvm_read`/`nvm_write`/`nvm_erase` are boot
-/// ROM routines that bit-bang a serial flash chip, wired either to the chip's internal
-/// interface or brought out to external pins (sharing GPIO4-7 with [`crate::spi::Spi`]),
-/// depending on the board - a fixed property of the board's own PCB design, not a runtime
-/// choice, which is why [`Nvm::new`]/[`Nvm::new_assume_sst`] use the one a `board-*` Cargo
-/// feature selects (`crate::board::NVM_INTERFACE`) rather than taking it as a parameter.
+/// The serial flash is wired either to the chip's internal interface or to external pins
+/// (shared with [`crate::spi::Spi`] on GPIO4-7). This is a fixed property of the board, so
+/// [`Nvm::new`]/[`Nvm::new_assume_sst`] use the interface selected by the `board-*` Cargo
+/// feature instead of taking it as a parameter.
 ///
-/// Picking the wrong one doesn't necessarily fail loudly: against a floating/unconnected bus,
-/// `nvm_detect`/`nvm_read`/`nvm_erase` can read back a consistent-but-fake pattern and report
-/// success, since none of them compare against expected data. `nvm_write`'s internal verify
-/// step is usually the first thing to actually notice, failing with [`Error::Rom`] wrapping
-/// `gNvmErrVerifyError_c`. Confirm against real hardware behavior (a write+read-back round
-/// trip, not just a read), not board documentation, when porting to a new board (see
-/// `crate::board`'s doc comment) - on the Redbee Econotag, `Internal` is correct despite
-/// `External` superficially "working" for detect/read/erase.
+/// The wrong interface doesn't necessarily fail loudly: on an unconnected bus, `nvm_detect`,
+/// `nvm_read` and `nvm_erase` can report success with fake data. Usually only `nvm_write`'s
+/// internal verify step notices, returning [`Error::Rom`] with `gNvmErrVerifyError_c`. When
+/// porting to a new board, confirm the choice with a write and read-back round trip. The Redbee
+/// Econotag uses [`NvmInterface::Internal`].
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum NvmInterface {
     /// The internal NVM interface (`gNvmInternalInterface_c`).
@@ -69,12 +67,12 @@ impl NvmInterface {
 /// NVM error.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum Error {
-    /// `nvm_detect` found no flash, or a type other than the SST-compatible 32 x 4096-byte
-    /// sector part this driver's [`NorFlash::ERASE_SIZE`]/[`ReadNorFlash::capacity`] assume.
+    /// `nvm_detect` found no flash, or a type other than the SST-compatible part (32 sectors of
+    /// 4096 bytes) this driver supports.
     UnsupportedFlash,
     /// An out-of-bounds or misaligned argument, caught before calling into the ROM.
     Bounds(NorFlashErrorKind),
-    /// A ROM routine reported a specific failure.
+    /// A ROM `nvm_*` routine returned an error.
     Rom(nvmErr_t),
 }
 
@@ -99,25 +97,25 @@ fn check_rom(err: nvmErr_t) -> Result<(), Error> {
     }
 }
 
-/// External or internal serial flash, driven through the boot ROM's `nvm_*` routines.
+/// Serial flash driven through the boot ROM's `nvm_*` routines.
 ///
-/// Only the SST-compatible geometry documented in `libmc1322x`'s `nvm.h` (32 sectors of 4096
-/// bytes each, 128 KiB total) is supported: [`Nvm::new`] calls `nvm_detect` and fails with
-/// [`Error::UnsupportedFlash`] if a different (or no) chip is found, rather than guessing at
-/// its geometry.
+/// Only the SST-compatible geometry from `libmc1322x`'s `nvm.h` (32 sectors of 4096 bytes,
+/// 128 KiB) is supported. Reads and writes have byte granularity; erases work on whole
+/// sectors.
 pub struct Nvm {
     interface: nvmInterface_t,
     nvm_type: nvmType_t,
 }
 
 impl Nvm {
-    /// Detect the flash chip on the board's [`NvmInterface`] (`crate::board::NVM_INTERFACE`,
-    /// selected at compile time - see that constant's doc comment).
+    /// Detect the flash chip on the board's [`NvmInterface`].
+    ///
+    /// Also powers up the 1.5 V/1.8 V regulators the ROM routines need.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::UnsupportedFlash`] if `nvm_detect` finds no chip, or one that isn't
-    /// the SST-compatible part this type assumes.
+    /// Returns [`Error::Rom`] if `nvm_detect` fails, or [`Error::UnsupportedFlash`] if it
+    /// detects a chip other than the SST-compatible part.
     pub fn new() -> Result<Self, Error> {
         prepare_flash_access();
         let interface = crate::board::NVM_INTERFACE.as_raw();
@@ -135,13 +133,11 @@ impl Nvm {
         })
     }
 
-    /// Construct an `Nvm` on the board's [`NvmInterface`] assuming the SST-compatible
-    /// geometry, without calling the ROM's `nvm_detect` at all.
+    /// Create an `Nvm` on the board's [`NvmInterface`] that assumes the SST-compatible part,
+    /// without calling `nvm_detect`.
     ///
-    /// Diagnostic escape hatch for boards/situations where `nvm_detect` itself hangs or faults
-    /// (e.g. when running from code loaded directly into RAM over JTAG, bypassing the chip's
-    /// normal boot sequence) - skips straight to the same SST type
-    /// [`Self::new`] would use anyway if detection succeeded.
+    /// For situations where `nvm_detect` hangs or faults, e.g. code loaded into RAM over JTAG
+    /// that bypassed the normal ROM boot sequence.
     pub fn new_assume_sst() -> Self {
         prepare_flash_access();
         Self {

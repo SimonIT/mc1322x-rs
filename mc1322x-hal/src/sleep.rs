@@ -1,28 +1,20 @@
 //! CRM low-power (Hibernate/Doze) control.
 //!
-//! Hibernate and Doze both power down the whole chip except the sleep timer, differing only
-//! in which clock stays alive to run it (RM §5.2.3, §5.3):
+//! Hibernate and Doze both power down the whole chip except the sleep timer, differing only in
+//! which clock keeps running it (RM §5.2.3, §5.3):
 //!
-//! - [`SleepMode::Hibernate`] keeps the ~2 kHz ring oscillator (or the 32.768 kHz crystal, if
-//!   [`crate::rtc::RtcCrystal`] started it) running — lowest current (~1 µA) but an imprecise
-//!   wake delay off the ring oscillator.
-//! - [`SleepMode::Doze`] keeps the reference oscillator ÷128 (~187.5 kHz) running — higher
-//!   current (~23 µA) but an accurate wake delay without needing a crystal.
+//! - [`SleepMode::Hibernate`] keeps the ~2 kHz ring oscillator (or the 32 kHz crystal, if
+//!   [`crate::rtc::RtcCrystal`] started it) running: lowest current (~1 µA), but an imprecise
+//!   wake delay on the ring oscillator.
+//! - [`SleepMode::Doze`] keeps the reference oscillator ÷128 (~187.5 kHz) running: higher
+//!   current (~23 µA), but an accurate wake delay without a crystal.
 //!
-//! There is no standard Rust trait for this (no HAL crate defines one — sleep/wake models are
-//! too MCU-specific to generalize), so [`sleep`] is a bespoke, from-scratch API.
+//! # Caveats
 //!
-//! # Hardware caveat: peripheral clocking is unreliable right after the first sleep/wake cycle
-//!
-//! UART transmits garbled bytes for a while after the *first* `sleep()`/wake cycle following
-//! boot. It isn't a leftover TX-in-flight race, a peripheral clock settling delay, or the UART
-//! needing re-initialization. What does clear it is completing further sleep/wake cycles
-//! (Doze or Hibernate, not a fixed count) — not passively waiting, however long. This points
-//! to a genuine MC1322x CRM/clock-generation quirk (likely an edge-triggered PLL/divider resync
-//! state machine, not one that settles with elapsed time) rather than a bug in this module. If
-//! you rely on a peripheral whose timing derives from the same clock right after the first
-//! post-boot `sleep()` call, don't trust its output directly - run a couple of harmless
-//! throwaway sleep/wake cycles first.
+//! After the *first* sleep/wake cycle following boot, UART transmits garbled bytes for a while.
+//! Waiting doesn't clear it and neither does re-initializing the UART; further sleep/wake
+//! cycles (Doze or Hibernate) do. If a peripheral's output must be correct right after the
+//! first [`sleep`], run a couple of throwaway sleep/wake cycles first.
 
 use mc1322x_sys::CRM_BASE;
 use portable_atomic::{AtomicU32, Ordering};
@@ -30,6 +22,7 @@ use portable_atomic::{AtomicU32, Ordering};
 const WU_CNTL: *mut u32 = (CRM_BASE as usize + 0x04) as *mut u32;
 const SLEEP_CNTL: *mut u32 = (CRM_BASE as usize + 0x08) as *mut u32;
 const STATUS: *mut u32 = (CRM_BASE as usize + 0x18) as *mut u32;
+const WU_COUNT: *mut u32 = (CRM_BASE as usize + 0x20) as *mut u32;
 const WU_TIMEOUT: *mut u32 = (CRM_BASE as usize + 0x24) as *mut u32;
 const RTC_TIMEOUT: *mut u32 = (CRM_BASE as usize + 0x2c) as *mut u32;
 
@@ -47,13 +40,10 @@ bitflags::bitflags! {
 const RAM_RET_SHIFT: u32 = 4;
 
 bitflags::bitflags! {
-    /// `WU_CNTL` plain flag bits (RM Table 5-7). The four `EXT_WU_*` sub-fields are all
-    /// indexed the same way instead of being single flags: sub-bit n (0..=3) is KBI(4+n), so
-    /// overall bit (shift+n) controls/reports KBI(4+n) - see [`EXT_WU_EN_SHIFT`] etc.
+    /// `WU_CNTL` plain flag bits (RM Table 5-7). The 4-bit `EXT_WU_*` sub-fields aren't
+    /// flags: bit (shift + n) controls KBI(4 + n) - see [`EXT_WU_EN_SHIFT`] etc.
     ///
-    /// TEMPORARY: testing whether `RTC_WU_IEN` (bit 17, distinct from `RTC_WU_EN`'s bit 1) is
-    /// needed alongside `RTC_WU_EN` for the RTC wake comparator to actually assert
-    /// `SLEEP_SYNC` on wake - `sleep()`'s RTC wake source currently hangs forever without it.
+    /// An RTC wake source sets both `RTC_WU_EN` and `RTC_WU_IEN`.
     #[derive(Clone, Copy, PartialEq, Eq)]
     struct WuCntl: u32 {
         const TIMER_WU_EN = 1 << 0;
@@ -84,14 +74,15 @@ const EXT_WU_EVT_SHIFT: u32 = 4;
 /// Which low-power mode to enter. See the module docs for the Hibernate/Doze trade-off.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum SleepMode {
+    /// Hibernate: sleep timer on the ring oscillator (or 32 kHz crystal).
     Hibernate,
+    /// Doze: sleep timer on the reference oscillator ÷128.
     Doze,
 }
 
 /// How much of RAM stays powered during sleep (RM Table 5-8, `RAM_RET[1:0]`).
 ///
-/// More retained RAM costs more sleep current; less retained RAM means more of your data
-/// needs to live outside RAM (e.g. in NVM) or be reconstructed on wake.
+/// More retained RAM costs more sleep current.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum RamRetention {
     /// 8 KB (page 0 only) — reset default.
@@ -115,6 +106,7 @@ pub struct Retention {
     pub mcu: bool,
     /// Retain GPIO pad state (`SLEEP_CNTL.DIG_PAD_EN`); ignored unless `mcu` is set.
     pub gpio_pads: bool,
+    /// How much RAM stays powered.
     pub ram: RamRetention,
 }
 
@@ -174,17 +166,14 @@ unsafe fn write_reg(reg: *mut u32, value: u32) {
 
 static SLEEP_INHIBIT_COUNT: AtomicU32 = AtomicU32::new(0);
 
-/// RAII guard that inhibits a sleep-aware executor (`mc1322x_embassy::SleepyExecutor`) from
-/// entering CRM sleep for as long as it's held.
+/// RAII guard that keeps a sleep-aware executor (`mc1322x_embassy::SleepyExecutor`) from
+/// entering CRM sleep while it's held.
 ///
 /// Every async peripheral wait in this crate (`uart`, `spi`, `i2c`, `delay`, `aes`, `adc`,
-/// `gpio`'s `KbiInput`) holds one for the duration of its pending wait. All of those
-/// peripherals lose their clock during [`sleep`] (`Doze`/`Hibernate` power down everything
-/// except the sleep timer) and can never raise the completion interrupt the wait depends on, so
-/// entering sleep while one is in flight would hang that task forever — a sleep-aware executor
-/// must check [`SleepInhibitGuard::count`] before sleeping and refuse to when it's nonzero.
-/// Constructible only from within this crate: only its own drivers should ever hold one, since
-/// this is exactly the set of things that actually inhibit sleep on this hardware.
+/// `gpio`'s `KbiInput`) holds one while it's pending. Those peripherals lose their clock during
+/// [`sleep`] and could never raise the interrupt the wait depends on, so a sleep-aware executor
+/// must check [`SleepInhibitGuard::count`] and not sleep while it's nonzero. Only this crate's
+/// drivers can create one.
 pub struct SleepInhibitGuard {
     _private: (),
 }
@@ -195,8 +184,8 @@ impl SleepInhibitGuard {
         SleepInhibitGuard { _private: () }
     }
 
-    /// Current inhibit count. Nonzero means at least one async peripheral wait in this crate is
-    /// currently in flight.
+    /// Number of guards currently held. Nonzero means at least one async peripheral wait in this
+    /// crate is in flight.
     pub fn count() -> u32 {
         SLEEP_INHIBIT_COUNT.load(Ordering::Acquire)
     }
@@ -208,14 +197,45 @@ impl Drop for SleepInhibitGuard {
     }
 }
 
+/// Read the wake-up timer (`WU_COUNT`), in ticks of the sleep-mode clock the last [`sleep`]
+/// ran on.
+///
+/// The timer restarts from zero on every entry into sleep and keeps counting after wake. Read
+/// right after [`sleep`] returns, it gives the time since the chip started going to sleep,
+/// including the wake-up sequence (reference oscillator start-up, regulator warm-up) that
+/// runs past the programmed [`WakeSources::timer`] timeout.
+pub fn timer_count() -> u32 {
+    unsafe { read_reg(WU_COUNT) }
+}
+
 /// Enter `mode` until one of `sources` wakes the chip, then return why.
 ///
 /// # Panics
 ///
-/// Panics if `sources` has no wake source configured at all — per RM Table 5-7, with no KBI
-/// pin armed a timer source (`timer` or `rtc`) must be, or the chip would sleep forever with
-/// no way to wake.
+/// Panics if `sources` has no wake source configured (RM Table 5-7), since the chip could
+/// then never wake.
 pub fn sleep(mode: SleepMode, sources: WakeSources, retention: Retention) -> WakeReason {
+    sleep_with(mode, sources, retention, || {})
+}
+
+/// Like [`sleep`], but calls `before_power_down` at the last point before the clocks stop.
+///
+/// `before_power_down` runs once the sleep request has been accepted (`SLEEP_SYNC` set), right
+/// before the write that lets the CRM power the chip down: the CPU clock, the peripheral
+/// clocks and the TMR counters stop a few instructions after it returns, and the wake-up timer
+/// ([`timer_count`]) starts from zero shortly after that. Use it for anything that must be
+/// measured right up to the start of sleep, e.g. a timer's position, so time can be accounted
+/// for across the sleep without a gap. Keep it short: the sleep request is already pending.
+///
+/// # Panics
+///
+/// Same as [`sleep`].
+pub fn sleep_with(
+    mode: SleepMode,
+    sources: WakeSources,
+    retention: Retention,
+    before_power_down: impl FnOnce(),
+) -> WakeReason {
     assert!(
         sources.timer.is_some() || sources.rtc.is_some() || sources.kbi.iter().any(Option::is_some),
         "no wake source configured — the chip would sleep forever"
@@ -261,38 +281,30 @@ pub fn sleep(mode: SleepMode, sources: WakeSources, retention: Retention) -> Wak
         }
         write_reg(WU_CNTL, wu_cntl);
 
-        // Entering: RM §5.3.1. Writing HIB/DOZE starts the power-down sequence; hardware sets
+        // Entering (RM §5.3.1): writing HIB/DOZE starts the power-down sequence, hardware sets
         // SLEEP_SYNC once its clock domain has synchronized (up to 2 sleep-clock cycles), and
-        // clearing SLEEP_SYNC is what actually lets power drop — execution pauses somewhere
-        // around here as the CRM gates the CPU's own clock, resuming (with `retention.mcu`)
-        // exactly where it left off once a wake source fires.
+        // clearing SLEEP_SYNC lets power drop. With `retention.mcu`, execution resumes here on
+        // wake.
         write_reg(SLEEP_CNTL, sleep_cntl);
         while !Status::from_bits_truncate(read_reg(STATUS)).contains(Status::SLEEP_SYNC) {
             core::hint::spin_loop();
         }
+        before_power_down();
         write_reg(STATUS, Status::SLEEP_SYNC.bits());
 
-        // Exiting: RM §5.3.2, the same handshake in reverse — hardware reasserts SLEEP_SYNC as
-        // part of waking, and software must clear it again to fully exit low-power mode.
+        // Exiting (RM §5.3.2): hardware reasserts SLEEP_SYNC on wake, and software must clear
+        // it again to fully exit low-power mode.
         while !Status::from_bits_truncate(read_reg(STATUS)).contains(Status::SLEEP_SYNC) {
             core::hint::spin_loop();
         }
-        // Kept as the raw register value (not `Status::from_bits_truncate`, which would drop
-        // the non-flag `EXT_WU_EVT` sub-field): clears SLEEP_SYNC and every *_EVT bit that
-        // fired in one write - rw1c bits that were 1 clear, bits that were 0 (including the
-        // read-only VREG_*_RDY bits) are unaffected.
+        // Write back the raw value (`from_bits_truncate` would drop the `EXT_WU_EVT`
+        // sub-field) to clear SLEEP_SYNC and every *_EVT bit that fired in one rw1c write.
         let raw_status = read_reg(STATUS);
         write_reg(STATUS, raw_status);
         let status = Status::from_bits_truncate(raw_status);
 
-        // RTC_WU_EVT is checked before HIB_WU_EVT/DOZE_WU_EVT: a wake-up-timer-class status
-        // bit can be set alongside a genuine RTC wake (an RTC wake with `TIMER_WU_EN` never
-        // set still reports HIB_WU_EVT, which the other order would misclassify as `Timer`),
-        // contradicting the RM's Table 5-13 description of
-        // HIB_WU_EVT/DOZE_WU_EVT as "only set if enabled by TIMER_WU_EN" - either a
-        // documentation inaccuracy or an interaction not covered by it. RTC_WU_EN/RTC_WU_IEN
-        // being the ones this call actually armed makes `Rtc` the correct answer whenever
-        // RTC_WU_EVT is set, regardless of what else also is.
+        // RTC_WU_EVT goes first: an RTC wake also sets HIB_WU_EVT even with TIMER_WU_EN
+        // clear, despite RM Table 5-13 saying it's "only set if enabled by TIMER_WU_EN".
         if status.contains(Status::RTC_WU_EVT) {
             WakeReason::Rtc
         } else if status.intersects(Status::HIB_WU_EVT | Status::DOZE_WU_EVT) {

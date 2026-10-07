@@ -28,12 +28,13 @@
 //! # Caveats
 //!
 //! - [`WatchdogConfig::hardware_timeout`] must be at most
-//!   [`Timeout::MAX`](mc1322x_hal::watchdog::Timeout::MAX) (~11.18 s); it's rounded up to the next
-//!   COP step (~87 ms). [`WatchdogConfig::check_interval`] must be comfortably shorter than it.
+//!   [`Timeout::MAX`](mc1322x_hal::watchdog::Timeout::MAX) (~11.18 s), or [`watchdog_run`]
+//!   panics; it's rounded up to the next COP step (~87 ms).
+//!   [`WatchdogConfig::check_interval`] must be comfortably shorter than it.
 //! - A task is found starved at the first check after its limit runs out, so the reset comes
 //!   up to `check_interval + hardware_timeout` after that.
-//! - The COP doesn't count while the chip sleeps, so `SleepyExecutor`'s Doze doesn't
-//!   cause spurious resets - see [`mc1322x_hal::watchdog`]'s caveats.
+//! - The COP doesn't count while the chip sleeps, so `SleepyExecutor`'s `Doze` doesn't cause
+//!   spurious resets; see [`mc1322x_hal::watchdog`].
 //!
 //! # Usage
 //!
@@ -90,7 +91,6 @@ use core::cell::RefCell;
 use critical_section::Mutex;
 use embassy_time::{Duration, Instant, Timer};
 use mc1322x_hal::watchdog::Watchdog as Cop;
-
 pub use task_watchdog::{Clock, HardwareWatchdog, Id, ResetReason};
 
 /// `task-watchdog`'s configuration, on [`EmbassyClock`].
@@ -98,7 +98,8 @@ pub type WatchdogConfig = task_watchdog::WatchdogConfig<EmbassyClock>;
 
 /// [`Clock`] backed by `embassy-time` (this crate's [`crate::time_driver`]).
 // `Copy` so `WatchdogConfig` (which derives `Copy` bounded on its clock type) is too.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct EmbassyClock;
 
 impl Clock for EmbassyClock {
@@ -124,6 +125,7 @@ impl Clock for EmbassyClock {
 
 /// How a task's start-up, before its first [`WatchdogRunner::feed`], is monitored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 enum Setup {
     /// Same as afterwards.
     None,
@@ -136,6 +138,7 @@ enum Setup {
 /// How a task is monitored; see the module docs. A plain [`Duration`] converts into a
 /// `TaskConfig` with just that timeout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct TaskConfig {
     timeout: Duration,
     retries: u8,
@@ -143,7 +146,8 @@ pub struct TaskConfig {
 }
 
 impl TaskConfig {
-    /// Must feed at least every `timeout`; no retries, no separate setup phase.
+    /// Create a config requiring a feed at least every `timeout`, with no retries and no
+    /// separate setup phase.
     pub const fn new(timeout: Duration) -> Self {
         Self {
             timeout,
@@ -159,14 +163,14 @@ impl TaskConfig {
         self
     }
 
-    /// Until its first feed, the task may take up to `setup_timeout` (from registration, or
-    /// from [`watchdog_run`] starting, whichever is later) instead.
+    /// Allow up to `setup_timeout` until the task's first feed, counted from registration or
+    /// from [`watchdog_run`] starting, whichever is later.
     pub const fn setup_timeout(mut self, setup_timeout: Duration) -> Self {
         self.setup = Setup::Bounded(setup_timeout);
         self
     }
 
-    /// Don't monitor the task at all until its first feed.
+    /// Don't monitor the task until its first feed.
     pub const fn unbounded_setup(mut self) -> Self {
         self.setup = Setup::Unbounded;
         self
@@ -181,7 +185,16 @@ impl From<Duration> for TaskConfig {
 
 /// [`WatchdogRunner::register_task`] failed: all `N` task slots are taken.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct NoSlotsAvailable;
+
+impl core::fmt::Display for NoSlotsAvailable {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("all task watchdog slots are taken")
+    }
+}
+
+impl core::error::Error for NoSlotsAvailable {}
 
 struct Task<I> {
     id: I,
@@ -232,15 +245,18 @@ impl<I: Id, const N: usize> State<I, N> {
     }
 }
 
-/// Shares a task table between the tasks feeding it and [`watchdog_run`]. Put it in a `static`
-/// (e.g. a `StaticCell`) so every task can hold a `&'static` reference to it. `N` is the number
-/// of task slots.
+/// Task table shared between the tasks feeding it and [`watchdog_run`].
+///
+/// `N` is the number of task slots. Put it in a `static` (e.g. a `StaticCell`) so every task can
+/// hold a `&'static` reference to it.
 pub struct WatchdogRunner<I: Id, const N: usize> {
     state: Mutex<RefCell<State<I, N>>>,
 }
 
 impl<I: Id, const N: usize> WatchdogRunner<I, N> {
-    /// Nothing starts until [`watchdog_run`] runs: register tasks first.
+    /// Create a runner for the COP `cop` with `config`.
+    ///
+    /// The COP isn't started and no task is monitored until [`watchdog_run`] runs.
     pub fn new(cop: Cop, config: WatchdogConfig) -> Self {
         Self {
             state: Mutex::new(RefCell::new(State {
@@ -255,15 +271,16 @@ impl<I: Id, const N: usize> WatchdogRunner<I, N> {
         critical_section::with(|cs| f(&mut self.state.borrow_ref_mut(cs)))
     }
 
-    /// Start monitoring `id` (see [`TaskConfig`]; a plain [`Duration`] is just a timeout),
-    /// counting from now, so a task can be registered at any time. Registering an `id` that's
-    /// already registered replaces its configuration and restarts its count, setup phase
-    /// included.
-    pub fn register_task(
-        &self,
-        id: &I,
-        config: impl Into<TaskConfig>,
-    ) -> Result<(), NoSlotsAvailable> {
+    /// Start monitoring `id`, counting from now.
+    ///
+    /// `config` is a [`TaskConfig`] or a plain [`Duration`] timeout. Tasks can be registered at
+    /// any time. Registering an `id` again replaces its configuration and restarts its count,
+    /// setup phase included.
+    ///
+    /// # Errors
+    ///
+    /// [`NoSlotsAvailable`] if `id` isn't registered yet and all `N` slots are taken.
+    pub fn register_task(&self, id: &I, config: impl Into<TaskConfig>) -> Result<(), NoSlotsAvailable> {
         let task = Task::new(*id, config.into());
         self.with(|state| {
             if let Some(existing) = state.task(id) {
@@ -289,8 +306,10 @@ impl<I: Id, const N: usize> WatchdogRunner<I, N> {
         });
     }
 
-    /// Check in for `id`. The first feed also ends its setup phase, if it has one. Does
-    /// nothing for an `id` that isn't registered.
+    /// Check in for `id`.
+    ///
+    /// The first feed also ends the task's setup phase, if it has one. Does nothing for an `id`
+    /// that isn't registered.
     pub fn feed(&self, id: &I) {
         self.with(|state| {
             if let Some(task) = state.task(id) {
@@ -309,17 +328,14 @@ impl<I: Id, const N: usize> WatchdogRunner<I, N> {
         None
     }
 
-    /// Feed the COP if no task has starved it; returns whether any task has starved it
-    /// instead. [`watchdog_run`] calls this every [`WatchdogConfig::check_interval`] - call it
-    /// yourself only if you're not using that.
+    /// Feed the COP unless a task has starved; returns whether one has.
+    ///
+    /// [`watchdog_run`] calls this every [`WatchdogConfig::check_interval`]; call it yourself
+    /// only if you don't use that.
     pub fn check_tasks(&self) -> bool {
         self.with(|state| {
             let now = Instant::now();
-            let starved = state
-                .tasks
-                .iter()
-                .flatten()
-                .any(|task| task.is_starved(now));
+            let starved = state.tasks.iter().flatten().any(|task| task.is_starved(now));
             if !starved {
                 HardwareWatchdog::<EmbassyClock>::feed(&mut state.cop);
             }
@@ -343,7 +359,13 @@ impl<I: Id, const N: usize> WatchdogRunner<I, N> {
 }
 
 /// Start the COP and keep feeding it for as long as every registered task keeps checking in.
+///
 /// Run this from its own `#[embassy_executor::task]`.
+///
+/// # Panics
+///
+/// Panics if [`WatchdogConfig::hardware_timeout`] is longer than
+/// [`Timeout::MAX`](mc1322x_hal::watchdog::Timeout::MAX), or if the COP has been locked.
 pub async fn watchdog_run<I: Id, const N: usize>(runner: &WatchdogRunner<I, N>) -> ! {
     let check_interval = runner.start();
     let mut next_check = Instant::now() + check_interval;

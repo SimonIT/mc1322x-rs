@@ -1,26 +1,20 @@
-//! The MC1322x's RTC block: a free-running 32-bit tick counter (`CRM->RTC_COUNT`), clocked by
-//! either the internal ~2 kHz ring oscillator (calibrated against `REF_OSC` at startup) or an
-//! external 32 kHz crystal.
+//! The RTC: a free-running 32-bit tick counter (`CRM->RTC_COUNT`), clocked by either the
+//! internal ~2 kHz ring oscillator or an external 32 kHz crystal.
 //!
-//! This is a counter, not a calendar: there is no year/month/day/hour/minute/second concept in
-//! the hardware, only ticks since [`RtcRingOscillator::new`]/[`RtcCrystal::new`] was called. The
-//! two types here mirror that split because it matters for how precisely each can report time:
+//! This is a counter, not a calendar: it only counts ticks since [`RtcRingOscillator::new`] or
+//! [`RtcCrystal::new`] started the oscillator.
 //!
-//! - [`RtcCrystal`] runs at an exact, compile-time-known 32 kHz.
-//! - [`RtcRingOscillator`] runs at a *calibrated* rate nominally near 2 kHz, but the exact value
-//!   ([`RtcRingOscillator::frequency_hz`]) is only known at runtime (it varies with temperature,
-//!   voltage and part tolerance) and isn't available until after calibration.
+//! - [`RtcCrystal`] ticks at the fixed [`RtcCrystal::FREQUENCY_HZ`].
+//! - [`RtcRingOscillator`] ticks at a rate calibrated against the reference oscillator at
+//!   startup. It's only known at runtime ([`RtcRingOscillator::frequency_hz`]) and varies with
+//!   temperature, voltage and part tolerance.
 //!
-//! That distinction is why `embedded-time`'s `Clock` trait (feature = "embedded-time") is only
-//! implemented for [`RtcCrystal`]: its `SCALING_FACTOR` must be a compile-time constant, which
-//! the ring oscillator's calibrated rate isn't. `fugit` (feature = "fugit") supports both, since
-//! it only needs the rate as a `now()` argument at the type level (a `Wrapping`-kind instant,
-//! matching the fact that this 32-bit counter really does wrap: roughly every 1.5 days at 32 kHz,
-//! or every 25 days at ~2 kHz).
+//! # Features
 //!
-//! Both features only add conversions on top of the always-available raw
-//! [`RtcCrystal::ticks`]/[`RtcRingOscillator::ticks`] API; neither is required to use this
-//! module.
+//! - `fugit`: `now()` on both types, returning a wrapping `fugit` instant (the 32-bit counter
+//!   wraps about every 1.5 days at 32 kHz, or every 25 days at ~2 kHz).
+//! - `embedded-time`: `embedded_time::Clock` for [`RtcCrystal`] only, since the trait's
+//!   `SCALING_FACTOR` must be a compile-time constant.
 
 use mc1322x_sys::{CRM_BASE, rtc_calibrate, rtc_freq, rtc_init_osc};
 
@@ -33,15 +27,18 @@ fn read_ticks() -> u32 {
 
 /// RTC clocked by the internal ~2 kHz ring oscillator.
 ///
-/// [`Self::new`] calibrates the oscillator against `REF_OSC` (the same calibration
-/// [`crate::delay::Delay`] runs), which takes a handful of milliseconds; the resulting
-/// [`Self::frequency_hz`] is usually close to, but not exactly, 2000.
+/// [`Self::new`] calibrates the oscillator against `REF_OSC` (as [`crate::delay::Delay::new`]
+/// does), which takes a few milliseconds. The resulting [`Self::frequency_hz`] is close to, but
+/// not exactly, 2000.
 pub struct RtcRingOscillator {
     _private: (),
 }
 
 impl RtcRingOscillator {
     /// Start and calibrate the ring oscillator.
+    ///
+    /// Doesn't give a working RTC once [`RtcCrystal::new`] has started the crystal oscillator;
+    /// see the caveat on [`RtcCrystal`].
     pub fn new() -> Self {
         unsafe { rtc_init_osc(0) };
         Self { _private: () }
@@ -52,8 +49,7 @@ impl RtcRingOscillator {
         unsafe { rtc_calibrate() };
     }
 
-    /// The raw tick count. Wraps every `u32::MAX / `[`Self::frequency_hz`]` seconds — about 25
-    /// days at the nominal ~2 kHz.
+    /// The raw tick count. Wraps about every 25 days at ~2 kHz.
     pub fn ticks(&self) -> u32 {
         read_ticks()
     }
@@ -70,7 +66,7 @@ impl Default for RtcRingOscillator {
     }
 }
 
-/// RTC clocked by an external 32 kHz crystal, exact (no calibration needed).
+/// RTC clocked by an external 32 kHz crystal. Needs no calibration.
 ///
 /// # Caveats
 ///
@@ -82,7 +78,7 @@ pub struct RtcCrystal {
 }
 
 impl RtcCrystal {
-    /// Exact tick frequency: the crystal needs no calibration.
+    /// Tick frequency in Hz (the value `libmc1322x` uses for the crystal).
     pub const FREQUENCY_HZ: u32 = 32_000;
 
     /// Start the crystal oscillator. See the caveat on [`RtcCrystal`] before calling this.
@@ -91,8 +87,7 @@ impl RtcCrystal {
         Self { _private: () }
     }
 
-    /// The raw tick count. Wraps every `u32::MAX / `[`Self::FREQUENCY_HZ`]` seconds — about 1.5
-    /// days.
+    /// The raw tick count. Wraps about every 1.5 days.
     pub fn ticks(&self) -> u32 {
         read_ticks()
     }
@@ -106,12 +101,11 @@ impl Default for RtcCrystal {
 
 #[cfg(feature = "fugit")]
 impl RtcRingOscillator {
-    /// The raw counter as a `fugit` instant on a wrapping (not monotonic) timeline, at a
-    /// **nominal** 2 kHz.
+    /// The tick count as a wrapping `fugit` instant at a **nominal** 2 kHz.
     ///
-    /// The real calibrated rate ([`Self::frequency_hz`]) varies by several percent and can't be
-    /// a `fugit` const generic; if you need the precise rate, scale [`Self::ticks`] by
-    /// [`Self::frequency_hz`] yourself instead of using this.
+    /// The calibrated rate ([`Self::frequency_hz`]) differs by several percent and can't be a
+    /// const generic. For precise timing, scale [`Self::ticks`] by [`Self::frequency_hz`]
+    /// instead.
     pub fn now(&self) -> fugit::WrappingTimerInstantU32<2_000> {
         fugit::WrappingTimerInstantU32::from_ticks(self.ticks())
     }
@@ -119,8 +113,7 @@ impl RtcRingOscillator {
 
 #[cfg(feature = "fugit")]
 impl RtcCrystal {
-    /// The raw counter as a `fugit` instant on a wrapping (not monotonic) timeline, at the
-    /// exact crystal rate ([`Self::FREQUENCY_HZ`]).
+    /// The tick count as a wrapping `fugit` instant at [`Self::FREQUENCY_HZ`].
     pub fn now(&self) -> fugit::WrappingTimerInstantU32<32_000> {
         fugit::WrappingTimerInstantU32::from_ticks(self.ticks())
     }
@@ -139,6 +132,4 @@ impl embedded_time::Clock for RtcCrystal {
 }
 
 // No `embedded_time::Clock` impl for `RtcRingOscillator`: `SCALING_FACTOR` must be a
-// compile-time constant, and the ring oscillator's calibrated rate isn't one — see the module
-// docs. Use [`RtcRingOscillator::now`] (feature = "fugit") or
-// [`RtcRingOscillator::ticks`]/[`RtcRingOscillator::frequency_hz`] instead.
+// compile-time constant, and the ring oscillator's calibrated rate isn't one.

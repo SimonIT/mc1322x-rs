@@ -17,13 +17,10 @@ fn main() {
     let gpio_util = include.join("gpio-util.h");
     let gpio_util_str = gpio_util.to_str().unwrap();
     let src = root.join("src");
-    // Linked against instead of the plain `src.a`: any program calling a ROM routine that
-    // itself calls through the boot ROM's "ROM Patch Table Vector" mechanism (fixed RAM
-    // offsets 0x20/0x60/0xa0/0xe0 from the load address - see `start.S`'s `USE_ROM_VARS`
-    // block) needs those slots reserved and populated with `bx lr` stubs, or the ROM call
-    // jumps into whatever unrelated code happens to occupy that RAM instead. `libmc1322x`'s
-    // own tests/Makefile builds every target touching `nvm_*`/radio ROM calls against this
-    // variant (`TARGETS_WITH_ROM_VARS`) for exactly this reason.
+    // `src-romvars.a` instead of `src.a`: ROM routines (`nvm_*`, radio) call through the ROM
+    // patch table vectors at RAM offsets 0x20/0x60/0xa0/0xe0, which this variant's `start.S`
+    // (`USE_ROM_VARS`) reserves and fills with `bx lr` stubs. libmc1322x's tests/Makefile uses
+    // it for the same targets (`TARGETS_WITH_ROM_VARS`).
     let srclib = src.join("src-romvars.a");
 
     println!("cargo:include={}", include.display());
@@ -46,18 +43,9 @@ fn main() {
         std::str::from_utf8(&output.stderr).unwrap()
     );
 
-    // The plain `make` above builds `src.a` as a side effect of the default (non-ROM-vars)
-    // TARGETS, but doesn't reliably reach `src-romvars.a` (a dependency of the
-    // TARGETS_WITH_ROM_VARS .bin files, several boards deep in `Makefile.include`'s
-    // per-board recursion) - ask for it directly so it exists regardless.
-    //
-    // This must run from `tests/` (not `src/`, which has no `Makefile` - only the
-    // variable-less `Makefile.src` fragment it `-include`s): `tests/Makefile` sets `MC1322X :=
-    // ..` and defines the real `$(MC1322X)/src/src-romvars.a` rule, so the target is requested
-    // by that same relative path. A stale `src/src-romvars.a` normally masked this working by
-    // accident (cargo's build-script caching meant this command wasn't actually re-run for a
-    // long time) - if this ever regresses, deleting `src/{start,start-romvars}.o` and
-    // `src/src{,-romvars}.a` forces a clean rebuild that exercises this path for real.
+    // The plain `make` above doesn't reliably build `src-romvars.a`, so request it explicitly.
+    // It must run from `tests/`: `src/` has no Makefile, and `tests/Makefile` (with
+    // `MC1322X := ..`) defines the `$(MC1322X)/src/src-romvars.a` rule under this path.
     let romvars_output = Command::new("make")
         .current_dir(&tests)
         .arg("../src/src-romvars.a")
@@ -93,13 +81,8 @@ fn main() {
     );
     println!("cargo:rustc-link-lib=c");
 
-    // A handful of specific libgcc objects (32-bit division; `libmc1322x/lib/pwm.c`'s Thumb-1
-    // `switch`-statement jump tables, first needed once `mc1322x-hal::pwm` was actually
-    // exercised) are needed as real, non-weak symbols rather than `compiler_builtins`' own weak
-    // fallbacks - see the root `.cargo/config.toml`'s rustflags comment for why, and why they're
-    // force-linked individually rather than via a plain `-lgcc`/`--whole-archive`. Extract them
-    // here from this toolchain's own `libgcc.a`, into a fixed path (not `$OUT_DIR`, which
-    // changes every build) so that static rustflags entry can name them directly.
+    // Extract the libgcc objects `.cargo/config.toml` force-links (32-bit division, Thumb-1
+    // `switch` jump tables); see the comments there.
     extract_libgcc_objects(&multilib_flags);
 
     let bindings = bindgen::Builder::default()
@@ -172,10 +155,9 @@ fn main() {
         .expect("Failed to write to bindings.rs");
 }
 
-/// Extract the specific libgcc objects this workspace's root `.cargo/config.toml` force-links
-/// (see its rustflags comment) from this toolchain's own `libgcc.a`, into
-/// `<workspace root>/.libgcc-thumbv4t/` - a fixed, `.gitignore`d path outside `$OUT_DIR` so that
-/// static rustflags entry can reference them without needing to know a build-specific path.
+/// Extract the libgcc objects that `.cargo/config.toml` force-links from the installed
+/// toolchain's `libgcc.a` into `<workspace root>/.libgcc-thumbv4t/`. A fixed, gitignored path
+/// rather than `$OUT_DIR`, so the static rustflags can name the files.
 fn extract_libgcc_objects(multilib_flags: &[&str]) {
     let libgcc_path = arm_none_eabi_gcc_file(multilib_flags, "libgcc.a");
 
@@ -209,9 +191,8 @@ fn extract_libgcc_objects(multilib_flags: &[&str]) {
     );
 }
 
-/// Ask `arm-none-eabi-gcc` where `file` (e.g. `libc.a`) lives for the given
-/// set of target flags, so the multilib variant always matches whatever
-/// toolchain is actually installed.
+/// Ask `arm-none-eabi-gcc` where `file` (e.g. `libc.a`) lives for the multilib selected by
+/// `flags`.
 fn arm_none_eabi_gcc_file(flags: &[&str], file: &str) -> PathBuf {
     let output = Command::new("arm-none-eabi-gcc")
         .args(flags)

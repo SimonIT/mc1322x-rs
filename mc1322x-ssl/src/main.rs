@@ -1,17 +1,16 @@
-//! Minimal Second Stage Loader (SSL): writes a firmware image to internal flash over UART1.
+//! Minimal Second Stage Loader (SSL): writes a firmware image to flash over UART1.
 //!
-//! Implements the subset of NXP AN3860's ("MC1322x Flash Loader Utility (Second Stage
-//! Loader)") documented UART protocol needed to erase, write, and commit a flash image:
-//! Erase Request (0x05), Write Request (0x03), Commit Request (0x04), Read Request (0x01),
-//! and the Confirm/Read Response replies. Loaded into RAM via JTAG (halt + load_image + set
-//! PC + resume) rather than the ROM UART1 bootstrap AN3860 describes, so there's no baud-rate
-//! detection handshake - just the "READY" banner and command loop AN3860 section 4.4
-//! describes from step 6 onward.
+//! Implements the subset of the UART protocol from NXP AN3860 ("MC1322x Flash Loader Utility
+//! (Second Stage Loader)") needed to erase, write, commit and read back an image: Read (0x01),
+//! Write (0x03), Commit (0x04) and Erase (0x05) requests, answered with Confirm or Read Response
+//! frames. It is loaded into RAM over JTAG rather than through the ROM UART1 bootstrap, so there
+//! is no baud-rate detection: it prints `READY` and enters the command loop (AN3860 §4.4, from
+//! step 6).
 //!
 //! # Building
 //!
 //! ```text
-//! cargo build -p ssl --target thumbv4t-none-eabi
+//! cargo +nightly build -p mc1322x-ssl --release
 //! ```
 
 #![no_std]
@@ -19,8 +18,8 @@
 
 const BAUD: u32 = 115_200;
 
-/// SSL UART command format (AN3860 Table 2): SOF, then a 2-byte little-endian length, then
-/// that many command bytes, then a 1-byte sum-of-bytes checksum.
+/// Start of frame. A frame (AN3860 Table 2) is SOF, a 2-byte little-endian length, that many
+/// command bytes, and a 1-byte sum-of-bytes checksum.
 const SOF: u8 = 0x55;
 
 mod cmd {
@@ -40,17 +39,14 @@ mod status {
     pub const EXEC_ERROR: u8 = 0x07;
 }
 
-/// Commit's "Secure" field values (AN3860 4.2.4).
+/// Commit's "Secure" field values (AN3860 §4.2.4).
 const ENG_SECURED: u8 = 0xC3;
 const ENG_UNSECURED: u8 = 0x3C;
 
 mc1322x_hal::entry!(arm_main);
 
-// Raw UART1 TX, bypassing `Uart::new` - the peripheral/pins are already configured from
-// `arm_main`'s own `Uart::new` call, so this avoids reinitializing them (GPIO func-select,
-// baud divider) mid-panic while a write may be in flight. Also used outside the panic handler
-// (e.g. to report a ROM error code on a failed write) since it's a convenient,
-// allocation-free way to get a diagnostic byte onto the wire.
+// Raw UART1 TX for diagnostics (panic handler, ROM error codes). Uses the UART as configured by
+// `arm_main`'s `Uart::new`, without reinitializing it or needing the `Uart` handle.
 fn debug_putc(byte: u8) {
     unsafe {
         let utxcon = (mc1322x_sys::UART1_BASE + mc1322x_sys::UTXCON) as *const u32;
@@ -101,12 +97,8 @@ fn arm_main() -> ! {
     let mut uart = Uart::new(UartId::Uart1, BAUD);
     let _ = uart.write_all(b"UART_OK\r\n");
 
-    // Regulator power-up and ROM secure-variable clear (both required before any `nvm_*` ROM
-    // call) live in `Nvm::new_assume_sst`/`Nvm::new` - see `mc1322x_hal::nvm` for why. Which
-    // NVM interface (internal vs. external) to use is a fixed board-wiring property, so it's
-    // no longer a parameter here - it comes from mc1322x-hal's own `board-*` Cargo feature
-    // selection (`crate::board::NVM_INTERFACE`; see `mc1322x_hal::nvm::NvmInterface`'s doc
-    // comment for the hardware evidence behind that choice).
+    // Skips `nvm_detect`, which can hang when loaded over JTAG. The NVM interface comes from
+    // mc1322x-hal's `board-*` feature.
     let mut nvm = Nvm::new_assume_sst();
     let _ = uart.write_all(b"NVM_READY\r\n");
     let mut probe = [0u8; 16];
@@ -140,7 +132,7 @@ fn arm_main() -> ! {
             cmd::ERASE_REQUEST if len == 5 => {
                 let address = u32::from_le_bytes([frame[1], frame[2], frame[3], frame[4]]);
                 let ok = if address == 0xFFFF_FFFF {
-                    // Whole chip, excluding the reserved last 4 KB sector (AN3860 4.2.5).
+                    // Whole chip, excluding the reserved last 4 KB sector (AN3860 §4.2.5).
                     nvm.erase(0, 31 * 4096).is_ok()
                 } else {
                     let sector_start = address - (address % 4096);
@@ -223,9 +215,10 @@ fn arm_main() -> ! {
     }
 }
 
-/// Read one SOF-delimited frame into `buf`, returning the command length on success. Returns
-/// `None` (and discards nothing but the bad checksum) on a CRC mismatch, matching AN3860's
-/// "invalid command -> Confirm with an error status" behavior.
+/// Read one frame's command bytes into `buf` and return their length.
+///
+/// Returns `None` on a UART error, a zero or oversized length, or a checksum mismatch; only the
+/// last one is answered (with a `CRC_ERROR` Confirm).
 fn read_frame(uart: &mut mc1322x_hal::uart::Uart, buf: &mut [u8]) -> Option<usize> {
     use embedded_io::Read;
 

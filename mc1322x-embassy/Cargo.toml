@@ -4,8 +4,12 @@ version = "0.1.0"
 edition = "2024"
 description = "Embassy platform support for the NXP MC1322x"
 
+[package.metadata.docs.rs]
+all-features = true
+
 [dependencies]
 critical-section = { version = "1.2", features = ["restore-state-u32"] }
+defmt = { version = "1.0", optional = true }
 embassy-executor = { version = "0.10", features = ["portable-atomic"] }
 embassy-time = { version = "0.5", features = [
   "generic-queue-16",
@@ -20,17 +24,9 @@ portable-atomic = { version = "1.5", features = ["critical-section"] }
 task-watchdog = { version = "0.1.2", default-features = false, optional = true }
 
 [features]
-# `SleepyExecutor` registers its own `Pender` (see `sleepy_executor.rs`) via `raw::Executor`
-# directly, using `pender_impl!` - which may only run once in the whole crate tree. Gating the
-# whole module behind this feature is load-bearing, not cosmetic: without it, `sleepy_executor`
-# would always be compiled in (even for a consumer that never names `SleepyExecutor`), and once
-# a binary pulls in anything else from this crate too (`init()`, `time_driver` - i.e. every real
-# consumer), the linker packs the unused `__pender` into the same link unit anyway and it
-# collides with `platform-spin`'s own `__pender` - a real link error. A binary that wants `SleepyExecutor` enables this feature and must not also
-# enable a `platform-*` feature (e.g. `platform-spin`) anywhere in its dependency graph; a binary
-# that leaves this feature off can use `platform-spin` freely.
+defmt = ["dep:defmt", "embassy-time/defmt"]
+# `sleepy_executor::SleepyExecutor`. It registers its own `Pender` (`__pender`), so it can't be
+# combined with any `embassy-executor` `platform-*` feature (e.g. `platform-spin`) in one binary.
 sleepy-executor = []
-# `task_watchdog` module: `embassy-time` clock + async runner for `task-watchdog`, on top of
-# `mc1322x-hal`'s COP backend for it, multiplexing several tasks' liveness onto the one hardware
-# watchdog.
+# `task_watchdog`: multiplexes several tasks' liveness onto the COP hardware watchdog.
 task-watchdog = ["dep:task-watchdog", "mc1322x-hal/task-watchdog"]

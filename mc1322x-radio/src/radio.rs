@@ -1,55 +1,13 @@
-//! IEEE 802.15.4 radio driver for the MC1322x MACA coprocessor.
+//! MACA driver built on the `libmc1322x` packet pool.
 //!
-//! The driver drives the packet pool API of `libmc1322x` through a small set
-//! of core async primitives (see the inherent methods on [`Mc1322xRadio`]
-//! below). These are frame-crate-agnostic: they move raw PHR+PSDU buffers
-//! (see [`crate::layout`]) in and out of the hardware and know nothing about
-//! `dot15d4` or `ieee802154`.
+//! The MACA runs a receive sequence whenever it is not transmitting (`libmc1322x` re-arms it from
+//! its interrupt handler). Received frames are queued by the C library; `maca_rx_callback` only
+//! counts them and wakes the pending future, which then pops a packet and copies the PSDU into the
+//! caller's buffer. Transmissions claim a free packet, copy the PSDU into it and queue it;
+//! `maca_tx_callback` records the MACA status code on action-complete.
 //!
-//! With the `dot15d4` feature, [`Mc1322xRadio`] additionally
-//! implements [`dot15d4::phy::radio::Radio`] as a thin wrapper around those
-//! primitives, which is the hardware glue that makes the dot15d4 CSMA layer
-//! (and the application layers built on it) run on a real 2.4 GHz radio. The
-//! `ieee802154` feature instead adds [`Mc1322xRadio::send_frame`] and
-//! [`Mc1322xRadio::receive_frame`], which fold an
-//! [`ieee802154::mac::Frame`]'s encoding/decoding directly into the transmit
-//! and receive path (no `Radio` trait, no CSMA/ACK handling — just a typed
-//! frame in, a typed frame out).
-//!
-//! # Architecture
-//!
-//! The MACA coprocessor runs a receive sequence at all times (re-armed by
-//! `libmc1322x` from its interrupt handler). Received frames are pushed onto
-//! an internal packet queue by the C library; the driver's RX callback
-//! (`maca_rx_callback`) simply bumps a counter and wakes the executor. The
-//! [`Mc1322xRadio::receive`] future then pops one packet and copies the PSDU
-//! into the caller-provided 128-byte buffer using the layout documented in
-//! [`crate::layout`].
-//!
-//! Transmissions go through the same packet pool:
-//! [`Mc1322xRadio::prepare_transmit`] claims a free packet, copies the PSDU
-//! out of the caller's buffer (reading the length from the PHR byte), and
-//! queues it. The MACA sequencer performs the transmission and raises the
-//! action-complete interrupt; the driver's TX callback (`maca_tx_callback`)
-//! records the status code and wakes the executor, after which
-//! [`Mc1322xRadio::transmit`] reports success.
-//!
-//! # CCA
-//!
-//! `libmc1322x` hardcodes the MACA control word to `maca_ctrl_mode_no_cca`
-//! (see `post_tx` in `lib/maca.c`), so the radio always transmits immediately,
-//! without a hardware channel-clear assessment. Contention is instead handled
-//! by the software CSMA-CA backoff of the dot15d4 layer together with ACK
-//! detection: a failed access or a missing ACK makes
-//! [`Mc1322xRadio::transmit`] return `false` and the MAC layer retries.
-//!
-//! # Startup
-//!
-//! [`Mc1322xRadio::init`] initializes the MACA coprocessor and must be called
-//! before the radio is used; it goes through
-//! [`mc1322x_hal::rng::ensure_maca_ready`], so it is idempotent and safe to
-//! call alongside HAL-side MACA users. The IEEE 802.15.4 extended address
-//! used for address filtering must be supplied there.
+//! `libmc1322x` always posts TX with `maca_ctrl_mode_no_cca` (`post_tx` in `lib/maca.c`), so there
+//! is no hardware CCA.
 
 use core::{
     cell::Cell,
@@ -66,26 +24,22 @@ use portable_atomic::AtomicU64;
 
 use crate::layout::MAX_PHR;
 
-/// The radio driver. A zero-sized type; all state lives in statics.
+/// IEEE 802.15.4 radio driver for the MACA coprocessor.
+///
+/// Buffers use the PHR+PSDU layout from [`crate::layout`]. The MACA appends and checks the FCS in
+/// hardware and drops frames with a bad FCS. Frames are sent without hardware CCA; a failed
+/// transmission makes [`transmit`](Self::transmit) return `false`.
+///
+/// This is a zero-sized handle; the driver state lives in statics shared with the MACA interrupt
+/// callbacks.
 pub struct Mc1322xRadio;
 
-/// Wraps [`Mc1322xRadio::receive`]'s returned future to make cancellation-by-drop safe on its
-/// own, instead of relying on the caller to observe the documented "call
-/// `cancel_current_operation` and poll to completion before dropping" contract.
+/// Future returned by [`Mc1322xRadio::receive`]; clears the receive state when dropped.
 ///
-/// That contract turns out to be impossible for callers to actually satisfy in general: a
-/// `select()` between this future and a timeout (exactly how `dot15d4`'s CSMA layer races the
-/// ACK-wait receive against its timeout) always drops the *losing* future as part of tearing
-/// down the `select()` itself, before any of the winning branch's own code (including a
-/// drop-guard that calls `cancel_current_operation`) gets a chance to run - Rust drops the
-/// actively-polled inner future of a suspended `async fn` before any of its enclosing locals.
-/// So by the time `cancel_current_operation` (called from `dot15d4`'s own `OnDrop` guard) runs,
-/// this future is already gone, and `rx_buffer`/`cancelled` would otherwise be left set from
-/// the abandoned operation until whatever `prepare_receive` call happens to come next. This is
-/// a defensive fix for that real gap - found while bisecting a *separate*, since-fixed hardware
-/// crash (an ARMv4T-incompatible interworking veneer for 64-bit division; see
-/// `vendor/libgcc-thumbv4t/README.md`) that turned out not to be caused by this gap after all,
-/// but the gap itself is real and worth closing regardless.
+/// Callers can't always call `cancel_current_operation` before the future is dropped: when a
+/// `select()` (e.g. `dot15d4`'s ACK wait against a timeout) is torn down, the losing future is
+/// dropped before the caller's own drop guard runs. Without this, the stale `rx_buffer` pointer
+/// and `cancelled` flag would survive until the next `prepare_receive`.
 struct ReceiveFuture<F> {
     inner: F,
 }
@@ -114,8 +68,8 @@ impl<F> Drop for ReceiveFuture<F> {
 
 /// Wrapper around the receive buffer pointer to mark it `Send + Sync`.
 ///
-/// The pointer is only ever dereferenced from the single executor while the
-/// CSMA radio guard is held, so this is sound.
+/// The pointer is only dereferenced by the receive future, inside a critical section, and only
+/// within the validity window promised by `prepare_receive`'s safety contract.
 struct RxBuffer(NonNull<[u8; 128]>);
 
 impl Copy for RxBuffer {}
@@ -138,7 +92,8 @@ struct State {
     rx_pending: Cell<u32>,
     /// Status code of the last completed transmission, from the MACA.
     tx_status: Cell<Option<u32>>,
-    /// Cached MACA channel index (0..=15, i.e. IEEE channel 11..=26).
+    /// Cached MACA channel index (0..=15, i.e. IEEE channel 11..=26), used for TX and RX.
+    /// `None` when unknown (after `enable`/`disable`).
     tx_channel: Cell<Option<u8>>,
     /// Set when an operation was cancelled; the pending operation must abort.
     cancelled: Cell<bool>,
@@ -169,43 +124,35 @@ static STATE: Mutex<State> = Mutex::new(State::new());
 
 /// The IEEE 802.15.4 extended (64-bit) address configured via [`Mc1322xRadio::init`].
 ///
-/// This target has no native atomics at all, so `portable-atomic`'s `critical-section` fallback
-/// backs this (see `mc1322x-hal::rng`'s `MACA_READY` for the same pattern) - functionally the
-/// same plain-Cell-behind-a-lock a bundled address field would need, just without a
-/// `critical_section::with` closure at each access site.
+/// ARMv4T has no atomic instructions; `portable-atomic` implements this with a critical section.
 static HW_ADDRESS: AtomicU64 = AtomicU64::new(0);
 
 impl Mc1322xRadio {
-    /// Number of entries in the MACA `PSMVAL`/`PAVAL`/`AIMVAL` power tables
-    /// (see `PSMVAL` in `libmc1322x/lib/maca.c`), i.e. the valid range for
-    /// [`Mc1322xRadio::set_output_power`].
+    /// Number of entries in the `PSMVAL`/`PAVAL`/`AIMVAL` power tables in `libmc1322x`'s
+    /// `lib/maca.c`, i.e. the number of levels accepted by [`Mc1322xRadio::set_output_power`].
     const POWER_LEVELS: u8 = 19;
 
     /// Initialize the MACA coprocessor and return the radio driver.
     ///
-    /// `address` is the IEEE 802.15.4 extended address used by the layers
-    /// above for address filtering (see [`Radio::ieee802154_address`]).
+    /// `address` is the IEEE 802.15.4 extended address reported by
+    /// [`ieee802154_address`](Self::ieee802154_address) to the MAC layer; it is not programmed
+    /// into the hardware.
     ///
-    /// Safe to call more than once, and safe to call alongside
-    /// [`mc1322x_hal::rng::ensure_maca_ready`]: both funnel through the same
-    /// guard, so whichever runs first performs the actual `maca_init` and the
-    /// other is a no-op.
+    /// The MACA is initialized through [`mc1322x_hal::rng::ensure_maca_ready`], so calling this
+    /// more than once, or after the HAL's RNG has already initialized the MACA, is fine. After
+    /// initialization the radio is on channel 11.
     pub fn init(address: [u8; 8]) -> Self {
         HW_ADDRESS.store(u64::from_ne_bytes(address), Ordering::Relaxed);
         mc1322x_hal::rng::ensure_maca_ready();
         Self
     }
 
-    /// Set the current MACA RF channel (IEEE 802.15.4 channel number, 11..=26).
+    /// Set the RF channel (IEEE 802.15.4 channel number, 11..=26).
     ///
-    /// The MACA has a single channel register shared between transmit and receive, so
-    /// whichever side last programmed it determines both directions - [`Mc1322xRadio::
-    /// prepare_transmit`] (and the `dot15d4`/`radio-hal` glue built on it) already does this as
-    /// part of every transmit. This method exists for callers who only ever *receive* (e.g. the
-    /// `ieee802154` feature's [`Mc1322xRadio::receive_frame`] used on its own): without it,
-    /// there is no way to move off whatever channel [`Mc1322xRadio::init`] leaves the hardware
-    /// on (`libmc1322x`'s `maca_init` defaults to index 0, i.e. channel 11), regardless of what
-    /// channel the sender actually transmits on.
+    /// The MACA has a single channel register for both transmit and receive.
+    /// [`prepare_transmit`](Self::prepare_transmit) sets the channel itself, so this is mainly
+    /// needed to select the receive channel. [`enable`](Self::enable) resets the channel,
+    /// so call this afterwards.
     ///
     /// # Panics
     ///
@@ -219,14 +166,14 @@ impl Mc1322xRadio {
         critical_section::with(|cs| set_channel_index(STATE.borrow(cs), channel - 11));
     }
 
-    /// Set the RF output power. Indexes the MACA `PSMVAL`/`PAVAL`/`AIMVAL`
-    /// tables (0 = lowest, `POWER_LEVELS - 1` = highest).
+    /// Set the RF output power level.
+    ///
+    /// `power` indexes `libmc1322x`'s power tables, from 0 (lowest) to 18 (highest). RM Table 3-4
+    /// lists the typical output power in dBm for levels 0..=17.
     ///
     /// # Panics
     ///
-    /// Panics if `power >= POWER_LEVELS`. `libmc1322x`'s `set_power` indexes
-    /// its power tables with no bounds check of its own, so an out-of-range
-    /// value here would read out of bounds in C.
+    /// Panics if `power` is greater than 18.
     pub fn set_output_power(&mut self, power: u8) {
         assert!(
             power < Self::POWER_LEVELS,
@@ -234,14 +181,16 @@ impl Mc1322xRadio {
             power,
             Self::POWER_LEVELS
         );
-        // Safety: single-threaded hardware register write; `power` was just
-        // checked against the table size.
+        // Safety: single-threaded hardware register write; `power` was just checked against the
+        // table size (the C `set_power` does no bounds check of its own).
         unsafe {
             mc1322x_sys::set_power(power);
         }
     }
 
-    /// Request the radio to idle to a low-power sleep mode.
+    /// Turn the radio off.
+    ///
+    /// Any prepared receive buffer is released. The returned future resolves on its first poll.
     pub fn disable(&mut self) -> impl Future<Output = ()> {
         async {
             // Safety: disables the radio hardware; only called while no
@@ -261,7 +210,10 @@ impl Mc1322xRadio {
         }
     }
 
-    /// Request the radio to wake from sleep.
+    /// Turn the radio on and start receiving.
+    ///
+    /// This resets the MACA, including the channel, and releases any prepared receive buffer.
+    /// The returned future resolves on its first poll.
     pub fn enable(&mut self) -> impl Future<Output = ()> {
         async {
             // Safety: enables the radio hardware.
@@ -278,12 +230,16 @@ impl Mc1322xRadio {
         }
     }
 
-    /// Request the radio to go in receive mode and try to receive a frame
-    /// into the supplied buffer.
+    /// Set the buffer that the next [`receive`](Self::receive) writes the received frame into.
+    ///
+    /// The frame is stored in the [`crate::layout`] format. The radio receives continuously while
+    /// enabled, so this does not start the receiver; the returned future resolves on its first
+    /// poll.
     ///
     /// # Safety
-    /// The supplied buffer must remain writable until either successful
-    /// reception, or the radio state changed.
+    ///
+    /// `bytes` must remain valid and writable until [`receive`](Self::receive) resolves or is
+    /// dropped, or the radio is enabled or disabled.
     pub unsafe fn prepare_receive(&mut self, bytes: &mut [u8; 128]) -> impl Future<Output = ()> {
         let ptr = NonNull::from(&mut *bytes);
         async move {
@@ -297,12 +253,14 @@ impl Mc1322xRadio {
         }
     }
 
-    /// Request the radio to go in receive mode and try to receive a frame.
+    /// Wait for a frame and copy it into the buffer set by
+    /// [`prepare_receive`](Self::prepare_receive).
     ///
-    /// Safe to drop before it resolves without calling
-    /// [`Mc1322xRadio::cancel_current_operation`] first (see [`ReceiveFuture`]'s doc comment):
-    /// the returned future cleans up its own driver state on drop regardless of how it's
-    /// polled.
+    /// Returns `true` if a frame was received, or `false` if the operation was cancelled with
+    /// [`cancel_current_operation`](Self::cancel_current_operation) or no buffer was prepared
+    /// (the frame is then discarded).
+    ///
+    /// The returned future may be dropped before it resolves; it releases the prepared buffer.
     pub fn receive(&mut self) -> impl Future<Output = bool> {
         ReceiveFuture {
             inner: Self::receive_inner(),
@@ -339,10 +297,8 @@ impl Mc1322xRadio {
                     }
                     return Poll::Ready(false);
                 };
-                // The buffer is only valid for this one reception (see
-                // `prepare_receive`'s safety contract); clear it so a stray
-                // future `receive()` call without a preceding
-                // `prepare_receive()` can't write through a dangling pointer.
+                // The buffer is only valid for this one reception; clear it so a later
+                // `receive()` without `prepare_receive()` can't write through a dangling pointer.
                 state.rx_buffer.set(None);
                 let dst: &mut [u8; 128] = unsafe { rx_buffer.0.as_mut() };
                 // Safety: `packet` was just popped from the RX queue by
@@ -354,19 +310,19 @@ impl Mc1322xRadio {
         })
     }
 
-    /// Request the radio to go in transmit mode and try to send a frame on
-    /// `channel` (the IEEE 802.15.4 channel number, 11..=26).
+    /// Queue the frame in `bytes` for transmission on `channel` (IEEE 802.15.4 channel number,
+    /// 11..=26).
     ///
-    /// The mutability of `bytes` is not to modify the buffer, but to hand
-    /// over exclusive ownership while the transmission is in flight.
+    /// `bytes` uses the [`crate::layout`] format; the PSDU length is taken from the PHR and
+    /// clamped to the buffer. The returned future waits until a free packet is available, copies
+    /// the frame into it and queues it; the MACA starts sending right away, without CCA. Use
+    /// [`transmit`](Self::transmit) to wait for the result.
     ///
-    /// Note: hardware CCA is not supported by `libmc1322x` (see the module
-    /// docs); the caller's own CCA policy is intentionally not consulted
-    /// here.
+    /// `bytes` is `&mut` only to hand over exclusive access; it is not modified.
     ///
     /// # Safety
-    /// The supplied buffer must remain valid until either successful
-    /// transmission, or the radio state changed.
+    ///
+    /// `bytes` must remain valid until the returned future resolves or is dropped.
     pub unsafe fn prepare_transmit(
         &mut self,
         channel: u8,
@@ -400,12 +356,8 @@ impl Mc1322xRadio {
 
                 set_channel_index(state, channel_index);
 
-                // The caller stores the frame length in the PHR byte. Also
-                // clamp to `bytes.len()`: callers only need to guarantee that
-                // `bytes` stays valid, not that it's exactly 128 bytes long,
-                // so a PHR claiming more than `bytes` actually holds must not
-                // read past its end (and an empty `bytes` must not panic on
-                // the `bytes[0]` read).
+                // The length comes from the PHR byte. `bytes` need not be 128 bytes long, so
+                // clamp to its length, and treat an empty slice as an empty frame.
                 let phr = bytes.first().copied().unwrap_or(0) as usize;
                 let len = phr
                     .saturating_sub(2)
@@ -419,9 +371,10 @@ impl Mc1322xRadio {
         })
     }
 
-    /// When working with futures, it is not always guaranteed that a future
-    /// will complete. This method is a notification to the radio that it can
-    /// prepare for cancelation of whichever operation is currently pending.
+    /// Cancel the pending [`receive`](Self::receive) or [`transmit`](Self::transmit).
+    ///
+    /// The pending future resolves with `false` on its next poll. A frame that is already being
+    /// sent is not stopped.
     pub fn cancel_current_operation(&mut self) {
         critical_section::with(|cs| {
             let state = STATE.borrow(cs);
@@ -433,9 +386,10 @@ impl Mc1322xRadio {
         });
     }
 
-    /// Request the radio to transmit the queued frame.
+    /// Wait for the frame queued by [`prepare_transmit`](Self::prepare_transmit) to be sent.
     ///
-    /// Returns whether the transmission was successful.
+    /// Returns `true` if the MACA reports success, or `false` on any other MACA status (e.g. no
+    /// ACK received) or if the operation was cancelled.
     pub fn transmit(&mut self) -> impl Future<Output = bool> {
         poll_fn(move |cx| {
             critical_section::with(|cs| {
@@ -467,14 +421,14 @@ impl Mc1322xRadio {
         })
     }
 
-    /// Combines [`Mc1322xRadio::prepare_transmit`] and [`Mc1322xRadio::transmit`] into one
-    /// `poll_fn`, with a single `.await` point at the call site instead of two consecutive
-    /// ones. Behaviorally identical to calling both in sequence; the only difference is there
-    /// is no `async fn` state-machine transition between them. Not used by the
-    /// `dot15d4::phy::radio::Radio` implementation, whose trait has no matching method.
+    /// Queue a frame and wait for it to be sent.
+    ///
+    /// Equivalent to [`prepare_transmit`](Self::prepare_transmit) followed by
+    /// [`transmit`](Self::transmit), as a single future.
     ///
     /// # Safety
-    /// Same contract as [`Mc1322xRadio::prepare_transmit`].
+    ///
+    /// `bytes` must remain valid until the returned future resolves or is dropped.
     pub unsafe fn prepare_and_transmit(
         &mut self,
         channel: u8,
@@ -504,9 +458,7 @@ impl Mc1322xRadio {
                     // not yet queued.
                     unsafe { queue_transmit(packet, &bytes[1..1 + len]) };
                     queued.set(true);
-                    // Fall through to check for completion in this same poll, rather than
-                    // returning Pending here and waiting for a separate outer `.await` to
-                    // re-poll - there is no separate outer await anymore.
+                    // Fall through and check for completion in this same poll.
                 }
 
                 if let Some(status) = state.tx_status.take() {
@@ -523,45 +475,40 @@ impl Mc1322xRadio {
         })
     }
 
-    /// Returns the IEEE 802.15.4 8-octet MAC address of the radio device.
+    /// Return the IEEE 802.15.4 extended address passed to [`init`](Self::init).
     pub fn ieee802154_address(&self) -> [u8; 8] {
         HW_ADDRESS.load(Ordering::Relaxed).to_ne_bytes()
     }
 }
 
-/// Debug counter, for inspection with a debugger: lowest IRQ-mode stack pointer ever observed
-/// at the top of `maca_rx_callback`/`maca_tx_callback` - both run nested inside `libmc1322x`'s
-/// `irq()` -> `maca_isr()` on the dedicated 256-byte IRQ-mode stack (`IRQ_STACK_SIZE` in
-/// `mc1322x-sys/libmc1322x/mc1322x.lds`). `u32::MAX` until the first callback runs. Compare
-/// against that stack's own `__stack_start__`/`__irq_stack_top__` linker symbols to see how
-/// close to overflow it got.
+/// Debug value for inspection with a debugger: lowest IRQ-mode stack pointer seen on entry to
+/// `maca_rx_callback`/`maca_tx_callback`, or `u32::MAX` before the first callback.
+///
+/// Both callbacks run inside `libmc1322x`'s `maca_isr` on the 256-byte IRQ-mode stack
+/// (`IRQ_STACK_SIZE` in `mc1322x.lds`); compare against `__irq_stack_top__` to see the headroom.
 #[unsafe(no_mangle)]
 pub static mut IRQ_MIN_SP_SEEN: u32 = u32::MAX;
 
-/// Debug counter: number of times `prepare_transmit`'s `poll_fn` has been polled at all.
+/// Debug counter: number of polls of `prepare_transmit`'s future.
 #[unsafe(no_mangle)]
 pub static mut PREPARE_TRANSMIT_POLLS: u32 = 0;
-/// Debug counter: number of those polls that found `claim_free_packet()` returning `None`
-/// (the C packet pool exhausted) and returned `Poll::Pending`.
+/// Debug counter: number of `prepare_transmit` polls that found no free packet.
 #[unsafe(no_mangle)]
 pub static mut PREPARE_TRANSMIT_NO_PACKET: u32 = 0;
-/// Debug flag: set to `1` once `prepare_transmit` has successfully claimed a packet and
-/// queued it (i.e. resolved `Poll::Ready`) at least once.
+/// Debug flag: `1` once `prepare_transmit` has queued a packet.
 #[unsafe(no_mangle)]
 pub static mut PREPARE_TRANSMIT_GOT_PACKET: u32 = 0;
-/// Debug counter: number of times `transmit`'s `poll_fn` has been polled at all.
+/// Debug counter: number of polls of `transmit`'s future.
 #[unsafe(no_mangle)]
 pub static mut TRANSMIT_POLLS: u32 = 0;
-/// Debug value: `1 + ` the last real MACA status code `transmit()` ever saw via
-/// `tx_status` (so `0` unambiguously means "never saw one").
+/// Debug value: last MACA status code seen by `transmit`, plus one (`0` = none seen yet).
 #[unsafe(no_mangle)]
 pub static mut TRANSMIT_STATUS_SEEN: u32 = 0;
-/// Debug flag: set to `1` if `transmit()` ever resolved via the `cancelled` branch
-/// instead of a real status.
+/// Debug flag: `1` once `transmit` has resolved because of a cancellation.
 #[unsafe(no_mangle)]
 pub static mut TRANSMIT_CANCELLED_SEEN: u32 = 0;
 
-/// Reads the current stack pointer and lowers [`IRQ_MIN_SP_SEEN`] if it's a new minimum.
+/// Update [`IRQ_MIN_SP_SEEN`] with the current stack pointer.
 #[inline(always)]
 fn record_irq_sp() {
     let sp: u32;
@@ -576,9 +523,9 @@ fn record_irq_sp() {
 
 /// RX callback, overriding the weak C symbol in `libmc1322x`.
 ///
-/// Runs in interrupt context before the C library pushes the packet onto its
-/// RX queue. Only wakes the executor; the packet is collected by
-/// [`Radio::receive`].
+/// Runs in interrupt context just before the C library pushes the packet onto its RX queue.
+/// Only counts the packet and wakes the pending future; the packet is collected by
+/// [`Mc1322xRadio::receive`] or `radio_hal::Receive::get_received`.
 #[unsafe(no_mangle)]
 extern "C" fn maca_rx_callback(_packet: *mut packet) {
     record_irq_sp();
@@ -593,8 +540,8 @@ extern "C" fn maca_rx_callback(_packet: *mut packet) {
 
 /// TX callback, overriding the weak C symbol in `libmc1322x`.
 ///
-/// Runs in interrupt context with the action-complete status already written
-/// into the packet by `libmc1322x`. Records the status and wakes the executor.
+/// Runs in interrupt context on action-complete, with the MACA status already written into the
+/// packet by `libmc1322x`. Records the status and wakes the pending future.
 #[unsafe(no_mangle)]
 extern "C" fn maca_tx_callback(packet: *mut packet) {
     record_irq_sp();
@@ -610,10 +557,8 @@ extern "C" fn maca_tx_callback(packet: *mut packet) {
     });
 }
 
-/// Programs the MACA channel register (0..=15, i.e. IEEE channel 11..=26)
-/// if it differs from what's already cached in `state`. Shared by
-/// [`Mc1322xRadio::prepare_transmit`] and, with the `radio-hal` feature,
-/// [`radio_hal::Channel::set_channel`](radio_hal::Channel).
+/// Program the MACA channel index (0..=15, i.e. IEEE channel 11..=26) if it differs from the
+/// one cached in `state`.
 fn set_channel_index(state: &State, index: u8) {
     if state.tx_channel.get() != Some(index) {
         // Safety: programs the radio channel register.
@@ -624,17 +569,15 @@ fn set_channel_index(state: &State, index: u8) {
     }
 }
 
-/// Claims a free TX packet from the C pool, if one is available. Shared by
-/// [`Mc1322xRadio::prepare_transmit`] and, with the `radio-hal` feature,
-/// [`radio_hal::Transmit::start_transmit`](radio_hal::Transmit).
+/// Claim a free packet from the C pool, if one is available.
 fn claim_free_packet() -> Option<*mut packet> {
     // Safety: claims a packet from the C free pool.
     let packet = unsafe { mc1322x_sys::get_free_packet() };
     if packet.is_null() { None } else { Some(packet) }
 }
 
-/// Copies `psdu` into a claimed TX packet and queues it for transmission on
-/// whatever channel is currently programmed.
+/// Copy `psdu` (clamped to 125 bytes) into a claimed packet and queue it for transmission on
+/// the currently programmed channel.
 ///
 /// # Safety
 /// `packet` must have come from [`claim_free_packet`] and not yet be queued.
@@ -650,10 +593,7 @@ unsafe fn queue_transmit(packet: *mut packet, psdu: &[u8]) {
     }
 }
 
-/// Pops a packet from the C RX queue if one is ready, decrementing
-/// `rx_pending`. Shared by [`Mc1322xRadio::receive`] and, with the
-/// `radio-hal` feature,
-/// [`radio_hal::Receive::get_received`](radio_hal::Receive).
+/// Pop a packet from the C RX queue if one is ready, decrementing `rx_pending`.
 fn pop_receive_packet(state: &State) -> Option<*mut packet> {
     if state.rx_pending.get() == 0 {
         return None;
@@ -669,9 +609,9 @@ fn pop_receive_packet(state: &State) -> Option<*mut packet> {
     Some(packet)
 }
 
-/// Copies the PSDU (without FCS) of a popped RX packet into `dst`, frees
-/// the packet, and returns the number of bytes copied and the MACA's LQI
-/// for it.
+/// Copy the PSDU (without FCS) of a popped RX packet into `dst` and free the packet.
+///
+/// Returns the number of bytes copied and the packet's LQI.
 ///
 /// # Safety
 /// `packet` must have come from [`pop_receive_packet`] and not yet be freed.
@@ -690,9 +630,7 @@ unsafe fn copy_received_psdu(packet: *mut packet, dst: &mut [u8]) -> (usize, u8)
     (len, lqi)
 }
 
-/// Implements `dot15d4`'s [`Radio`] trait as a thin wrapper around the core
-/// primitives above, translating `dot15d4`'s config/frame types to and from
-/// the driver's plain buffers.
+/// `dot15d4::phy::radio::Radio` implementation, forwarding to the inherent methods.
 #[cfg(feature = "dot15d4")]
 mod dot15d4_radio {
     use dot15d4::phy::{
@@ -735,8 +673,7 @@ mod dot15d4_radio {
             cfg: &TxConfig,
             bytes: &mut [u8],
         ) -> impl Future<Output = ()> {
-            // Note: hardware CCA is not supported by libmc1322x (see the
-            // module docs), so `cfg.cca` is intentionally ignored.
+            // libmc1322x never uses hardware CCA, so `cfg.cca` is ignored.
             let _cca = cfg.cca;
             let channel = u8::from(cfg.channel);
             // Safety: the trait's safety contract on `bytes` matches
@@ -758,11 +695,7 @@ mod dot15d4_radio {
     }
 }
 
-/// Folds the `ieee802154` crate's MAC frame codec directly into the
-/// transmit/receive path, the way the `dw1000` driver bakes
-/// `ieee802154::mac::Frame` into its own `send`/`receive` API rather than
-/// leaving codec and hardware as two separate steps the caller has to wire
-/// up themselves.
+/// Typed `ieee802154::mac::Frame` transmit/receive methods.
 #[cfg(feature = "ieee802154")]
 mod ieee802154_frame {
     use ieee802154::mac::Frame;
@@ -771,18 +704,21 @@ mod ieee802154_frame {
     use crate::layout::ieee802154::{read_frame, write_frame};
 
     impl Mc1322xRadio {
-        /// Encode `frame` and transmit it on `channel` (the IEEE 802.15.4
-        /// channel number, 11..=26).
+        /// Encode `frame` and transmit it on `channel` (IEEE 802.15.4 channel number, 11..=26).
         ///
-        /// Returns whether the transmission succeeded, or the [`byte::Error`]
-        /// if `frame` failed to serialize (e.g. it doesn't fit the 128-byte
-        /// buffer) — in which case the hardware is never touched.
+        /// Returns `Ok(true)` if the transmission succeeded and `Ok(false)` if it failed, as for
+        /// [`Mc1322xRadio::transmit`].
+        ///
+        /// # Errors
+        ///
+        /// Returns the [`byte::Error`] if `frame` cannot be serialized (e.g. it is longer than
+        /// 125 bytes). Nothing is transmitted in that case.
         ///
         /// # Safety
-        /// Same contract as [`Mc1322xRadio::prepare_transmit`]: the returned
-        /// future must be polled to completion, or
-        /// [`Mc1322xRadio::cancel_current_operation`] called and the future
-        /// then polled to completion, before being dropped.
+        ///
+        /// The returned future must be polled to completion, or
+        /// [`Mc1322xRadio::cancel_current_operation`] called and the future then polled to
+        /// completion, before it is dropped.
         pub unsafe fn send_frame(
             &mut self,
             channel: u8,
@@ -797,18 +733,17 @@ mod ieee802154_frame {
             }
         }
 
-        /// Try to receive a frame into `buffer`, decoding it into a
-        /// [`Frame`] that borrows from it.
+        /// Receive a frame into `buffer` and decode it into a [`Frame`] borrowing from it.
         ///
-        /// Returns `Ok(None)` if the operation was cancelled or superseded
-        /// before a frame arrived, or the [`byte::Error`] if a frame arrived
-        /// but failed to parse as a valid IEEE 802.15.4 PSDU.
+        /// Returns `Ok(None)` if the operation was cancelled before a frame arrived.
+        ///
+        /// # Errors
+        ///
+        /// Returns the [`byte::Error`] if the received PSDU is not a valid IEEE 802.15.4 frame.
         ///
         /// # Safety
-        /// Same contract as [`Mc1322xRadio::prepare_receive`]: the returned
-        /// future must be polled to completion, or
-        /// [`Mc1322xRadio::cancel_current_operation`] called and the future
-        /// then polled to completion, before being dropped.
+        ///
+        /// Same contract as [`Mc1322xRadio::prepare_receive`].
         pub unsafe fn receive_frame<'b>(
             &mut self,
             buffer: &'b mut [u8; 128],
@@ -826,38 +761,30 @@ mod ieee802154_frame {
     }
 }
 
-/// Implements the [`radio-hal`](https://docs.rs/radio) crate's `Transmit`,
-/// `Receive`, `State`, `Channel` and `Busy` traits for [`Mc1322xRadio`].
-///
-/// `radio-hal`'s API is polling-based (`start_*`/`check_*`) rather than
-/// `async`, so these impls talk to the packet pool directly instead of going
-/// through the futures above, mirroring their logic under synchronous,
-/// single-poll semantics.
-///
-/// [`radio_hal::Power`] and [`radio_hal::Rssi`] are implemented against the
-/// MC1322x Reference Manual (RM), since `libmc1322x` itself documents
-/// neither a dBm mapping for its power tables nor a LQI/RSSI conversion:
-///
-/// - [`radio_hal::Power`]: RM Table 3-4 ("MC1322x PA Level vs. Output
-///   Power") gives typical dBm values for 18 of the 19 entries in
-///   `libmc1322x`'s `PSMVAL`/`PAVAL`/`AIMVAL` power tables (see
-///   [`Mc1322xRadio::set_output_power`]); see [`POWER_TABLE_DBM_TENTHS`] for
-///   the table and the caveat on the 19th, undocumented level.
-/// - [`radio_hal::Rssi`]: RM §6 ("LQI Software Function Calls") gives
-///   `Input Power (dBm) = (LQI / 3) - 100` as the conversion from the
-///   MACA's LQI (`libmc1322x`'s `get_lqi`) to dBm; see [`lqi_to_rssi_dbm`].
-///   [`radio_hal::Rssi::poll_rssi`] reflects the last packet the MACA
-///   computed LQI for rather than a continuous energy-detect scan —
-///   `libmc1322x` exposes no separate "poll now" primitive.
-///
-/// Not implemented, and why:
-///
-/// - [`radio_hal::Interrupts`] and [`radio_hal::Registers`]: this driver
-///   hides interrupts and registers behind the packet pool API and has
-///   nothing meaningful to expose at that level (see the module docs on
-///   [`crate::radio`]).
 #[cfg(feature = "radio-hal")]
 pub mod radio_hal {
+    //! Implementations of the [`radio`](https://docs.rs/radio) crate's (`radio-hal`) traits for
+    //! [`Mc1322xRadio`].
+    //!
+    //! Implemented: [`Transmit`], [`Receive`], [`State`], [`Channel`], [`Busy`], [`Power`],
+    //! [`Rssi`] and [`radio_hal::Radio`](::radio_hal::Radio). These traits are non-blocking
+    //! (`start_*`/`check_*`), so they access the packet pool directly instead of going through
+    //! the async methods.
+    //!
+    //! - [`Transmit::start_transmit`] takes the PSDU without PHR or FCS and sends it on the
+    //!   channel last set with [`Channel::set_channel`] (or by an async transmit).
+    //! - [`State::set_state`] with [`Mc1322xRadioState::Idle`] resets the channel; set the
+    //!   channel afterwards.
+    //! - [`Power::set_power`] selects the level from RM Table 3-4 ("MC1322x PA Level vs. Output
+    //!   Power") closest to the requested dBm value. Level 18, which the table does not list, is
+    //!   only reachable through [`Mc1322xRadio::set_output_power`].
+    //! - [`Rssi::poll_rssi`] and [`ReceiveInfo::rssi`] convert the MACA's LQI with
+    //!   `Input Power (dBm) = (LQI / 3) - 100` (RM chapter 6, before Table 6-2), giving -100 to
+    //!   -15 dBm. `poll_rssi` reports the last received packet, not a live energy-detect reading.
+    //!
+    //! `Interrupts` and `Registers` are not implemented; the driver hides both behind the packet
+    //! pool API.
+
     use core::future::Future;
     use core::pin::pin;
     use core::sync::atomic::Ordering;
@@ -881,13 +808,12 @@ pub mod radio_hal {
         InvalidChannel,
     }
 
-    /// [`radio_hal::State`] state for [`Mc1322xRadio`]: on (continuously
-    /// receiving, per the [`crate::radio`] module docs) or off.
+    /// Radio state for the [`State`] trait.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum Mc1322xRadioState {
-        /// MACA enabled; the coprocessor is running its receive sequence.
+        /// Radio on and receiving.
         Idle,
-        /// MACA disabled (low-power sleep).
+        /// Radio off.
         Sleep,
     }
 
@@ -901,16 +827,15 @@ pub mod radio_hal {
         }
     }
 
-    /// Tracks the state last requested through [`State::set_state`] (`true` =
-    /// [`Mc1322xRadioState::Idle`]); there is no hardware register to read it back from. This
-    /// target has no native atomics at all, so `portable-atomic`'s `critical-section` fallback
-    /// backs this - see `mc1322x-hal::rng`'s `MACA_READY` for the same pattern.
+    /// State last set through [`State::set_state`] (`true` = [`Mc1322xRadioState::Idle`]); it
+    /// can't be read back from the hardware.
     static RADIO_STATE: AtomicBool = AtomicBool::new(true);
 
-    /// Per-received-packet info: the MACA's link quality indicator.
+    /// Information about a received packet.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     pub struct Info {
-        /// Raw link quality indicator reported by the MACA for this packet.
+        /// Link quality indicator reported by the MACA (0x00 = about -100 dBm, 0xFF = about
+        /// -15 dBm).
         pub lqi: u8,
     }
 
@@ -920,24 +845,16 @@ pub mod radio_hal {
         }
     }
 
-    /// Converts the MACA's LQI (`libmc1322x`'s `get_lqi`, 0x00..=0xFF) to an
-    /// estimated received signal strength in dBm, per the MC1322x Reference
-    /// Manual §6 ("LQI Software Function Calls"): `Input Power (dBm) =
-    /// (LQI / 3) - 100`. 0x00 is documented as ~-100 dBm and 0xFF as ~-15
-    /// dBm; this is a hardware-computed estimate, not a calibrated
-    /// measurement.
+    /// Convert an LQI value to an estimated input power in dBm (RM chapter 6:
+    /// `(LQI / 3) - 100`).
     fn lqi_to_rssi_dbm(lqi: u8) -> i16 {
         i16::from(lqi) / 3 - 100
     }
 
-    /// Typical output power in tenths of a dBm for MACA power levels
-    /// 0..=17 (see [`Mc1322xRadio::set_output_power`]), from the MC1322x
-    /// Reference Manual Table 3-4 ("MC1322x PA Level vs. Output Power").
+    /// Typical output power in tenths of a dBm for power levels 0..=17, from RM Table 3-4.
     ///
-    /// `libmc1322x`'s `PSMVAL`/`PAVAL`/`AIMVAL` tables have a 19th entry
-    /// (index 18, `Mc1322xRadio::POWER_LEVELS - 1`) with register values
-    /// distinct from index 17's, but Table 3-4 documents no dBm value for
-    /// it — it's unreachable through [`Power::set_power`].
+    /// `libmc1322x`'s tables have a 19th level (index 18) that Table 3-4 does not list, so
+    /// [`Power::set_power`] never selects it.
     const POWER_TABLE_DBM_TENTHS: [i16; 18] = [
         -300, -280, -270, -260, -240, -210, -190, -170, -160, -150, -110, -100, -45, -30, -15, -10,
         17, 30,
@@ -946,8 +863,7 @@ pub mod radio_hal {
     impl Power for Mc1322xRadio {
         type Error = Error;
 
-        /// Sets the output power to whichever of [`POWER_TABLE_DBM_TENTHS`]'s
-        /// documented levels is closest to `power`.
+        /// Set the output power to the documented level closest to `power` dBm (-30 to +3 dBm).
         fn set_power(&mut self, power: i8) -> Result<(), Self::Error> {
             let target = i16::from(power) * 10;
             let index = POWER_TABLE_DBM_TENTHS
@@ -964,10 +880,7 @@ pub mod radio_hal {
     impl Rssi for Mc1322xRadio {
         type Error = Error;
 
-        /// Returns the last LQI the MACA computed, converted to dBm via
-        /// [`lqi_to_rssi_dbm`]. Reflects the last packet received, not a
-        /// continuous energy-detect scan — `libmc1322x` exposes no separate
-        /// "poll now" RSSI/ED primitive for this to call instead.
+        /// Return the input power in dBm estimated from the LQI of the last received packet.
         fn poll_rssi(&mut self) -> Result<i16, Self::Error> {
             // Safety: `get_lqi` is a ROM entry point populated at boot,
             // takes no arguments and has no side effects beyond reading
@@ -985,9 +898,8 @@ pub mod radio_hal {
         fut.as_mut().poll(&mut cx)
     }
 
-    /// Poll a future that is known to always resolve on its first poll (as
-    /// [`Mc1322xRadio::enable`]/[`Mc1322xRadio::disable`] do: their bodies
-    /// have no `.await` point).
+    /// Poll a future that always resolves on its first poll, such as
+    /// [`Mc1322xRadio::enable`]/[`Mc1322xRadio::disable`].
     fn ready<F: Future>(fut: F) -> F::Output {
         match poll_now(fut) {
             Poll::Ready(output) => output,
@@ -1086,19 +998,15 @@ pub mod radio_hal {
         type Info = Info;
 
         fn start_receive(&mut self) -> Result<(), Self::Error> {
-            // The MACA receives continuously once enabled (see the
-            // `crate::radio` module docs); there is nothing to arm here
-            // beyond clearing a stale cancellation.
+            // The MACA receives continuously once enabled; only clear a stale cancellation.
             critical_section::with(|cs| STATE.borrow(cs).cancelled.set(false));
             Ok(())
         }
 
         fn check_receive(&mut self, _restart: bool) -> Result<bool, Self::Error> {
-            // `restart` needs no handling: corrupted frames (bad CRC or
-            // address filter mismatch) never reach the C library's RX queue
-            // in the first place (see `checksum_failed_irq`/
-            // `filter_failed_irq` in `libmc1322x`'s `maca_isr`), and the
-            // hardware always re-arms itself for the next reception.
+            // `restart` needs no handling: frames failing the CRC or address filter never reach
+            // the RX queue (see `checksum_failed_irq`/`filter_failed_irq` in `maca_isr`), and
+            // the MACA re-arms itself after every reception.
             Ok(critical_section::with(|cs| {
                 STATE.borrow(cs).rx_pending.get() > 0
             }))

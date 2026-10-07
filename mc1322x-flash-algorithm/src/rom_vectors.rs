@@ -1,41 +1,21 @@
 //! MC1322x ROM patch-vector table.
 //!
-//! The boot ROM's library routines (`nvm_detect` and friends) internally call through four
-//! fixed RAM offsets from address `0x400000` - `0x20`, `0x60`, `0xa0`, `0xe0` - expecting either
-//! a real patch or a harmless `bx lr` stub there (see libmc1322x's `src/start.S`, guarded by
-//! `USE_ROM_VARS`). RAM offset `0x120`-`0x7ff` from the same base is reserved as the ROM's own
-//! scratch storage. Without these, a ROM call jumps into whatever code happens to occupy that
-//! RAM offset - here, that would be the middle of our own `EraseChip`/`EraseSector`/`Init`
-//! functions, which are linked starting at `0x400000`: `Init()` then runs for the full timeout
-//! and crashes with an ARM "Undefined Instruction" exception deep in RAM, well past this
-//! algorithm's own code.
+//! The boot ROM's routines (`nvm_detect` and friends) call through four fixed RAM addresses,
+//! `0x400020`, `0x400060`, `0x4000a0` and `0x4000e0`, expecting a patch or a `bx lr` stub there
+//! (libmc1322x's `src/start.S`, `USE_ROM_VARS`), and use `0x400120..0x400800` as scratch RAM.
+//! Without the stubs, ROM calls jump into this algorithm's own code, which starts at `0x400000`.
 //!
-//! Runtime placement note: this target has no explicit `load_address` in
-//! `MC1322x_Series.yaml`, so probe-rs prepends a fixed 4-byte "infinite loop" safety-net header
-//! (`ARM_FLASH_BLOB_HEADER_LOOP_A32_LE` in probe-rs's `flash_algorithm.rs`, `[u32; 1]`) before
-//! this blob when loading it into RAM. Every offset below is therefore 4 bytes less than the
-//! ROM's actual expected absolute address (e.g. `0x1c` here lands at runtime `0x400020`). If
-//! that header ever changes size, these offsets need to move with it.
-//!
-//! `link.x` places the `.rom_vectors` section first in `PrgCode`, before anything else, so these
-//! offsets - relative to this section's own start - land exactly where the ROM expects them.
+//! `link.x` places `.rom_vectors` first in `PrgCode`. probe-rs prepends a 4-byte infinite-loop
+//! header to the blob (no `load_address` in the target YAML), so every offset below is 4 less
+//! than its runtime address (`0x1c` lands at `0x400020`). If that header changes size, these
+//! offsets must move with it.
 core::arch::global_asm!(
     r#"
 .section .rom_vectors, "ax"
 
-/* This chip's ARM7TDMI exception vector table lives at fixed, hardware-defined addresses
- * `0x400000`-`0x40001c` (runtime): Reset/Undef/SWI/PrefetchAbort/DataAbort/Reserved/IRQ/FIQ,
- * one word each - see libmc1322x's `src/start.S`, which installs a real vector table there for
- * normal application binaries. probe-rs's own prepended 4-byte safety-net header already traps
- * the Reset slot (runtime `0x400000`), but the other seven slots (runtime `0x400004`-`0x40001c`)
- * would otherwise fall in this section's own unfilled padding before `_rptv_0` - meaning any
- * exception at all (a stray SWI, an undefined instruction from wandering execution, or an
- * ordinary IRQ before `Init()` masks interrupts) would vector the core into whatever zero-fill
- * happened to be sitting there, rather than a safe, recognizable trap. Each of the seven `b .`
- * self-branches below closes that gap with a safe infinite-loop trap (all sharing one label, so
- * any of the seven vectors firing parks the core at the same, easily recognizable address)
- * instead of leaving it open. This exactly fills the gap up to (not including) `_rptv_0` at
- * `.org 0x1c`, so it doesn't disturb the ROM patch-vector offsets below at all.
+/* Exception vectors (runtime 0x400004-0x40001c; probe-rs's header covers Reset): trap any
+ * exception in one self-branch instead of running into padding. Exactly fills the space up to
+ * `_rptv_0`.
  */
 .arm
 _exception_trap:
@@ -64,8 +44,8 @@ _rptv_2:
 _rptv_3:
     bx lr
 
-/* Reserve the ROM's own scratch region (runtime 0x120-0x7ff) - leave it unfilled, nothing
- * of ours may start before this point. */
+/* Reserve the ROM's scratch RAM (runtime 0x400120-0x4007ff): nothing of ours may start
+ * before this point. */
 .org 0x7fb
 .arm
     .word 0

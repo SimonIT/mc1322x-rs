@@ -1,13 +1,10 @@
-//! `embedded-test` harness for `mc1322x-hal`: on-target checks of real peripheral drivers, run
-//! via `probe-rs run` against actual hardware (see `mc1322x-hal`'s crate-level docs).
-//! `embedded-test` reflashes and resets the board before every `#[test]`, so each test starts
-//! from a clean boot - drivers that document a "only call `::new()` once per boot" caveat (e.g.
-//! [`Aes::new`]'s self-test) are safe to bring up fresh in every test function here.
+//! On-target `embedded-test` tests for `mc1322x-hal`, run through `probe-rs run`.
 //!
-//! Deliberately blocking-only: this harness doesn't pull in `embassy-executor`, so only the
-//! synchronous half of each driver's API is exercised here. Peripherals that need external
-//! wiring the board may or may not have (e.g. UART2 loopback, a real SPI/I2C device, a second
-//! board for radio) are deliberately left out rather than silently depending on it.
+//! The board is reset before every `#[test]`, so each test starts from a clean boot and can
+//! construct drivers that may only be created once per boot (e.g. `Aes::new`).
+//!
+//! Only the blocking APIs are tested (no executor), and only peripherals that need no external
+//! wiring (no UART loopback, SPI/I2C device or second radio board).
 
 #![no_std]
 #![no_main]
@@ -44,20 +41,15 @@ mod tests {
 
     #[test]
     fn rtc_delay_runs() {
-        // Exercises real hardware (the RTC-based blocking delay), to confirm the harness can
-        // actually observe target-side effects and to force linking in `libmc1322x`'s
-        // ROM-patch-vector-dependent code (which `start.S`'s `_start`/exception vectors are
-        // bundled with) - a trivial, hardware-untouching test doesn't reference any of that at
-        // all.
+        // Touches real hardware (the RTC-based blocking delay), which also pulls in
+        // `libmc1322x`'s ROM-patch-dependent code that the trivial tests don't reference.
         let mut delay = Delay::new();
         delay.delay_ms(10);
     }
 
     #[test]
     fn aes_ecb_known_answer() {
-        // FIPS-197 Appendix B / C.1 AES-128 known-answer test - see `Aes::ecb_encrypt_block`'s
-        // own doc comment for how CTR mode with an all-zero data block yields raw single-block
-        // ECB encryption.
+        // FIPS-197 Appendix C.1 AES-128 known-answer test.
         const KEY: [u8; 16] = [
             0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
             0x0e, 0x0f,
@@ -78,9 +70,7 @@ mod tests {
 
     #[test]
     fn rng_reads_are_not_degenerate() {
-        // Sanity check for the MACA_RANDOM LFSR itself: a stuck
-        // register (always 0, or always the same value) would pass a naive "it returns a u32"
-        // check but be useless as a source of variation.
+        // Catch a stuck MACA_RANDOM register (always 0, or always the same value).
         ensure_maca_ready();
         let mut rng = Rng::new();
 
@@ -102,10 +92,8 @@ mod tests {
 
     #[test]
     fn rng_seed_and_read_is_deterministic() {
-        // `Rng::seed_and_read`'s own doc comment guarantees that a seed immediately followed by
-        // exactly one read is fully deterministic regardless of prior LFSR state. Check that
-        // specific guarantee here, with a different seed's own read interleaved so this can't
-        // pass by coincidence (e.g. the hardware just always returning the same value).
+        // `seed_and_read` must be deterministic regardless of prior LFSR state; a different seed
+        // in between rules out passing by coincidence.
         ensure_maca_ready();
         let mut rng = Rng::new();
 
@@ -122,10 +110,8 @@ mod tests {
 
     #[test]
     fn adc_internal_reference_reads_in_range() {
-        // Channel 8 is the internal 1.2V reference (see `Adc`'s own doc comment) - unlike a
-        // GPIO channel, it needs no external wiring to produce a meaningful (if not exactly
-        // predictable in raw counts) reading, so it's the one channel this harness can check
-        // without depending on external wiring.
+        // Channel 8 is the internal 1.2 V reference, the only channel that needs no external
+        // wiring.
         let mut adc = Adc::new();
         for _ in 0..5 {
             let value = adc.read(8);
@@ -138,9 +124,7 @@ mod tests {
 
     #[test]
     fn pwm_set_duty_cycle_runs_the_timer() {
-        // Register-level check: `Pwm`/`SetDutyCycle` has no getter API to check the duty cycle
-        // actually "took" through the public interface alone, so this reads TMR1's own CNTR
-        // register directly to check the timer is genuinely counting, not just configured.
+        // `Pwm` has no getter, so read TMR1's CNTR register directly to check the timer counts.
         const TIMER: u8 = 1;
 
         let mut pwm = Pwm::new(TIMER, 1000);

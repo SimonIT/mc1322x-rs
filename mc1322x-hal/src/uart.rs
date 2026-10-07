@@ -1,9 +1,19 @@
+//! UART1/UART2 driver, implementing the blocking `embedded-io` and async `embedded-io-async`
+//! `Read`/`Write` traits.
+//!
+//! # Interrupts
+//!
+//! [`Uart::new`] enables the UART's interrupt in the ITC (`INT_NUM_UART1`/`INT_NUM_UART2`),
+//! dispatched by `libmc1322x`'s `irq()` to this module's `uart1_isr`/`uart2_isr`. Only the async
+//! implementation unmasks the peripheral's RX/TX-ready interrupts.
+
 use core::convert::Infallible;
 use core::task::Poll;
 use embedded_io::{ErrorType, Read, Write};
 use mc1322x_sys::{
-    INTBASE, UART_struct, UART1_BASE, UART2_BASE, UCON, UDATA, URXCON, USTAT, UTXCON,
-    gpio_select_function, gpio_set_pad_dir, uart_flowctl, uart_setbaud,
+    INTBASE, INTENNUM_OFF, UART_struct, UART1_BASE, UART2_BASE, UCON, UDATA, URXCON, USTAT,
+    UTXCON, gpio_select_function, gpio_set_pad_dir, interrupt_nums_INT_NUM_UART1,
+    interrupt_nums_INT_NUM_UART2, uart_flowctl, uart_setbaud,
 };
 
 use crate::util::WakerCell;
@@ -14,23 +24,18 @@ bitflags::bitflags! {
     struct Ucon: u32 {
         const TXE = 1 << 0;
         const RXE = 1 << 1;
-        // `MTXR`/`MRXR` *mask* the TX-ready/RX-ready interrupt sources: 1 = masked (off). This
-        // is the opposite polarity of `TXE`/`RXE` above, so both must be set at init time to
-        // keep the async path's interrupts quiescent until armed (see
-        // [`Uart::wait_rx_ready`]/[`Uart::wait_tx_ready`]) — otherwise the reset-value-0 mask
-        // bits leave the (already latched, see [`FIFO_WATERMARK`]) TX-ready condition
-        // unmasked, and once [`Uart::new`] routes the interrupt through the ITC it fires
-        // immediately and forever.
+        // `MTXR`/`MRXR` *mask* the TX/RX-ready interrupts: 1 = masked, the opposite polarity of
+        // `TXE`/`RXE`. They reset to 0, so `Uart::new` sets them; otherwise the TX-ready
+        // condition (true whenever the FIFO has room) would fire as soon as the ITC enable is set.
         const MTXR = 1 << 13;
         const MRXR = 1 << 14;
     }
 }
 
 bitflags::bitflags! {
-    /// `UART_STAT` bits 6/7 (RM 11.5.1.5): level-triggered "FIFO has crossed its watermark"
-    /// flags, set by hardware whenever `rx_count()`/`tx_free()` cross the level last written to
-    /// `URXCON`/`UTXCON`. Unlike I2C's `I2C_MIF`, nothing here needs to be cleared by software:
-    /// the condition self-clears as soon as the FIFO count no longer satisfies the watermark.
+    /// `UART_STAT` bits 6/7 (RM 11.5.1.5): level-sensitive "FIFO level reached the watermark in
+    /// `URXCON`/`UTXCON`" flags. They clear themselves once the FIFO level no longer satisfies
+    /// the watermark; software never clears them.
     #[derive(Clone, Copy, PartialEq, Eq)]
     struct Ustat: u32 {
         const RXRDY = 1 << 6;
@@ -38,22 +43,16 @@ bitflags::bitflags! {
     }
 }
 
-// `URXCON`/`UTXCON` are dual-purpose (see `libmc1322x`'s `uart.c`): a write latches the
-// watermark used for `USTAT_RXRDY`/`USTAT_TXRDY`, while a read (as in `rx_count`/`tx_free`
-// below) returns the FIFO's live byte count, independent of the watermark. Using the lowest
-// possible watermark (1) makes "RX/TX ready" mean the same thing an interrupt-free polling
-// loop already checks (`rx_count() > 0` / `tx_free() > 0`), at the cost of `flush` seeing
-// spurious wakeups before the TX FIFO is fully drained (`USTAT_TXRDY` triggers on *any* free
-// slot, not on empty) — harmless since `flush` re-checks and re-arms each time.
+// `URXCON`/`UTXCON` are dual-purpose (see `libmc1322x`'s `uart.c`): a write sets the watermark
+// for `USTAT_RXRDY`/`USTAT_TXRDY`, a read returns the FIFO's current level. A watermark of 1
+// makes "ready" mean `rx_count() > 0` / `tx_free() > 0`. The async `flush` therefore wakes on
+// any free TX slot rather than on empty, and simply re-checks and waits again.
 const FIFO_WATERMARK: u32 = 1;
 
-// ITC (interrupt controller) offset/numbers for the UART completion interrupts (see
-// `isr.h`'s `INTENNUM_OFF` and `interrupt_nums`), following the same wiring as
-// `crate::i2c`'s `INT_NUM_I2C`. `irq()` (linked from `libmc1322x`) dispatches them to the
-// weak `uart1_isr`/`uart2_isr` symbols overridden at the bottom of this file.
-const INTENNUM_OFF: u32 = 0x8;
-const INT_NUM_UART1: u32 = 1;
-const INT_NUM_UART2: u32 = 2;
+// ITC numbers of the UART interrupts. `irq()` dispatches them to the weak `uart1_isr`/`uart2_isr`
+// symbols overridden at the bottom of this file.
+const INT_NUM_UART1: u32 = interrupt_nums_INT_NUM_UART1;
+const INT_NUM_UART2: u32 = interrupt_nums_INT_NUM_UART2;
 
 const UART_FUNCTION: u8 = 1;
 
@@ -69,9 +68,8 @@ const TX_FIFO_DEPTH: u32 = 32;
 
 /// Per-UART RX/TX wakers for the `embedded-io-async` implementation.
 ///
-/// RX and TX are independent FIFOs, so a pending read and a pending write can be armed at
-/// the same time; each gets its own slot. One instance per physical UART, since both can be
-/// in use concurrently.
+/// A pending read and a pending write can be armed at the same time, so each gets its own
+/// slot.
 struct UartWakers {
     rx: WakerCell,
     tx: WakerCell,
@@ -92,20 +90,19 @@ static UART2_WAKERS: UartWakers = UartWakers::new();
 /// Which UART peripheral to use.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum UartId {
+    /// UART1: TX on GPIO14, RX on GPIO15.
     Uart1,
+    /// UART2: TX on GPIO18, RX on GPIO19.
     Uart2,
 }
 
-/// UART on the given peripheral, implementing both the blocking [`embedded_io::Read`]/
-/// [`embedded_io::Write`] and, via [`embedded_io_async::Read`]/[`embedded_io_async::Write`],
-/// an async equivalent.
+/// UART driver implementing [`embedded_io::Read`]/[`embedded_io::Write`] and
+/// [`embedded_io_async::Read`]/[`embedded_io_async::Write`].
 ///
-/// TX and RX use the 32-byte hardware FIFOs. The UART is configured for 8
-/// data bits, no parity and one stop bit. The blocking implementation polls the FIFO level
-/// registers directly; the async implementation instead arms the RX/TX-ready interrupt
-/// (`UCON_MRXR`/`UCON_MTXR`, routed through the ITC as `INT_NUM_UART1`/`INT_NUM_UART2`) and
-/// waits to be woken by [`uart1_isr`]/[`uart2_isr`] — see [`Self::wait_rx_ready`]/
-/// [`Self::wait_tx_ready`] for the arm/wake handshake.
+/// Uses the 32-byte hardware FIFOs, 8 data bits, no parity and one stop bit. The blocking
+/// implementation busy-polls the FIFO levels; the async implementation waits for the
+/// RX/TX-ready interrupt instead and holds a [`crate::sleep::SleepInhibitGuard`] while
+/// waiting.
 pub struct Uart {
     uart: *mut UART_struct,
     id: UartId,
@@ -122,7 +119,8 @@ unsafe fn write_reg_raw(uart: *mut UART_struct, offset: u32, value: u32) {
 }
 
 impl Uart {
-    /// Configure and enable a UART at the requested baud rate.
+    /// Configure and enable a UART at `baud` bit/s, and switch its TX/RX pins to the UART
+    /// function.
     pub fn new(id: UartId, baud: u32) -> Self {
         let (uart, tx_pin, rx_pin, int_num) = match id {
             UartId::Uart1 => (
@@ -141,12 +139,10 @@ impl Uart {
 
         let uart = Self { uart, id };
 
-        // The UART must be enabled before its alternate function is selected
-        // on the pads, otherwise the pads stay in GPIO mode (RM 11.5.1.2).
+        // The UART must be enabled before its alternate function is selected on the pads,
+        // otherwise the pads stay in GPIO mode (RM 11.5.1.2).
         //
-        // MTXR/MRXR are masked (disabled) here so the async path's interrupts stay
-        // quiescent until `wait_rx_ready`/`wait_tx_ready` explicitly arm them; the
-        // blocking `Read`/`Write` impls below never touch these bits.
+        // MTXR/MRXR start masked; only `wait_rx_ready`/`wait_tx_ready` unmask them.
         unsafe {
             uart.write_reg(
                 UCON,
@@ -165,9 +161,8 @@ impl Uart {
 
         uart.set_baud(baud);
 
-        // Route the UART's interrupt to the core. This only affects the async path: the
-        // peripheral-local masks (`UCON_MTXR`/`UCON_MRXR`) stay set until `wait_rx_ready`/
-        // `wait_tx_ready` arm them, so the blocking API is unaffected.
+        // Enable the UART's interrupt in the ITC. Nothing fires until `wait_rx_ready`/
+        // `wait_tx_ready` unmask `MRXR`/`MTXR`.
         unsafe {
             core::ptr::write_volatile((INTBASE + INTENNUM_OFF) as *mut u32, int_num);
         }
@@ -183,7 +178,8 @@ impl Uart {
         }
     }
 
-    /// Reprogram the baud rate divider (UART must be disabled while doing so).
+    /// Reprogram the baud rate divider. `uart_setbaud` disables TX/RX while doing so and
+    /// re-enables them afterwards.
     fn set_baud(&self, baud: u32) {
         unsafe {
             uart_setbaud(self.uart, baud);
@@ -192,8 +188,8 @@ impl Uart {
 
     /// Enable or disable hardware RTS/CTS flow control.
     ///
-    /// Muxes the RTS/CTS pins (UART1: GPIO17/16, UART2: GPIO21/20) onto the
-    /// UART, so a previous GPIO configuration of those pins is overridden.
+    /// Enabling muxes the RTS/CTS pins (UART1: GPIO17/16, UART2: GPIO21/20) onto the UART,
+    /// overriding any previous GPIO configuration of those pins.
     pub fn set_flow_control(&mut self, on: bool) {
         unsafe {
             uart_flowctl(self.uart, on as u8);
@@ -222,12 +218,11 @@ impl Uart {
 
     /// Async wait until the RX FIFO holds at least one byte.
     ///
-    /// Arms `UCON_MRXR` and waits for [`uart1_isr`]/[`uart2_isr`] to wake this task, rather
-    /// than polling. The check-then-arm sequence runs inside a single
-    /// [`critical_section::with`] call so a byte landing between the check and enabling the
-    /// interrupt can't be missed: interrupts stay masked for the whole sequence, so if
-    /// `USTAT_RXRDY` is already set by the time `UCON_MRXR` is cleared, the pending interrupt
-    /// fires as soon as the critical section ends.
+    /// Unmasks `UCON_MRXR` and waits for [`uart1_isr`]/[`uart2_isr`] to wake this task. The
+    /// check and the unmask run in one critical section, so a byte arriving in between raises
+    /// the interrupt as soon as the section ends instead of being missed.
+    ///
+    /// Holds a [`crate::sleep::SleepInhibitGuard`] while waiting.
     async fn wait_rx_ready(&mut self) {
         let mut inhibit = None;
         core::future::poll_fn(|cx| {
@@ -246,12 +241,8 @@ impl Uart {
         .await
     }
 
-    /// Async equivalent of [`Self::wait_rx_ready`] for the TX FIFO having a free slot.
-    ///
-    /// Both this and [`Self::wait_rx_ready`] hold a [`crate::sleep::SleepInhibitGuard`] for as
-    /// long as the wait is in flight - see that type's doc comment for why a sleep-aware
-    /// executor must not sleep while this module's completion interrupt is what a task is
-    /// waiting on.
+    /// Async wait until the TX FIFO has a free slot. Same mechanism as [`Self::wait_rx_ready`],
+    /// using `UCON_MTXR`.
     async fn wait_tx_ready(&mut self) {
         let mut inhibit = None;
         core::future::poll_fn(|cx| {
@@ -320,9 +311,7 @@ impl Write for Uart {
     }
 }
 
-/// `embedded-io-async`'s `Read` reuses `embedded-io`'s `ErrorType`, already implemented
-/// above; see [`Uart::wait_rx_ready`] for why this waits on the real RX-ready interrupt
-/// rather than polling in a loop like [`Read::read`] above.
+/// Waits on the RX-ready interrupt instead of busy-polling.
 impl embedded_io_async::Read for Uart {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
         if buf.is_empty() {
@@ -340,9 +329,7 @@ impl embedded_io_async::Read for Uart {
     }
 }
 
-/// `embedded-io-async`'s `Write` reuses `embedded-io`'s `ErrorType`, already implemented
-/// above; see [`Uart::wait_tx_ready`] for why this waits on the real TX-ready interrupt
-/// rather than polling in a loop like [`Write::write`]/[`Write::flush`] above.
+/// Waits on the TX-ready interrupt instead of busy-polling.
 impl embedded_io_async::Write for Uart {
     async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
         if buf.is_empty() {
@@ -369,16 +356,9 @@ impl embedded_io_async::Write for Uart {
 
 /// Shared body of [`uart1_isr`] and [`uart2_isr`].
 ///
-/// This deliberately does *not* touch `USTAT`: unlike I2C's `I2C_MIF`, the ready flags
-/// self-clear once the FIFO count no longer satisfies its watermark, so
-/// [`Uart::wait_rx_ready`]/[`Uart::wait_tx_ready`] (run from task context once woken) already
-/// observe the up-to-date state via `rx_count`/`tx_free`. Instead this re-masks whichever of
-/// `UCON_MRXR`/`UCON_MTXR` is currently asserted — which deasserts the interrupt line so
-/// `irq()`'s dispatch loop can terminate rather than re-entering this handler forever — and
-/// wakes whichever task armed the wait.
-///
-/// See [`crate::util::WakerCell::wake`] for why waking a waker left behind by a cancelled
-/// (dropped) async read/write future is harmless.
+/// The `USTAT` ready flags clear themselves, so this doesn't touch them. It re-masks
+/// `UCON_MRXR`/`UCON_MTXR` for whichever condition is asserted, so `irq()` doesn't re-enter
+/// the handler forever, and wakes the matching task.
 fn uart_isr_common(uart: *mut UART_struct, wakers: &UartWakers) {
     let stat = Ustat::from_bits_truncate(unsafe { read_reg_raw(uart, USTAT) });
     let mut mask = Ucon::empty();
@@ -403,16 +383,11 @@ fn uart_isr_common(uart: *mut UART_struct, wakers: &UartWakers) {
 
 /// UART1 RX/TX-ready interrupt handler.
 ///
-/// Overrides the weak `uart1_isr` symbol declared in `libmc1322x`'s `isr.h`; the linked
-/// `irq()` handler (`mc1322x-sys/libmc1322x/src/isr.c`) dispatches here whenever
-/// `INT_NUM_UART1` is pending. See [`uart_isr_common`] for the shared logic and
-/// [`crate::i2c::i2c_isr`] for why this is unconditionally linked into any binary that
-/// depends on `mc1322x-hal`, whether or not it ever constructs a UART1 [`Uart`].
+/// Overrides the weak `uart1_isr` symbol declared in `libmc1322x`'s `isr.h`; `irq()` calls it
+/// whenever `INT_NUM_UART1` is pending. Linked into every binary that depends on this crate,
+/// whether or not it uses UART1.
 ///
-/// # Caveats
-///
-/// Like `crate::i2c::i2c_isr`, the ROM's `irq()` dispatcher must use interworking (`bx`) to
-/// call this from ARM state into this crate's Thumb code.
+/// `irq()` runs in ARM state and must call this Thumb code with interworking (`bx`).
 #[unsafe(no_mangle)]
 extern "C" fn uart1_isr() {
     uart_isr_common(UART1_BASE as *mut UART_struct, &UART1_WAKERS);
